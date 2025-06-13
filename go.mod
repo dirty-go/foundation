@@ -1,4 +1,4 @@
-module github.com/timemore/foundation
+module github.com/dirty-go/foundation
 
 go 1.20
 
