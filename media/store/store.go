@@ -8,9 +8,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/timemore/foundation/errors"
-	"github.com/timemore/foundation/media"
 	"golang.org/x/crypto/blake2b"
+
+	"github.com/dirty-go/foundation/errors"
+	"github.com/dirty-go/foundation/media"
 )
 
 type Store struct {

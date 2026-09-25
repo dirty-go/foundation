@@ -7,7 +7,7 @@ import (
 	"encoding/base64"
 	"math/big"
 
-	"github.com/timemore/foundation/errors"
+	"github.com/dirty-go/foundation/errors"
 )
 
 var (

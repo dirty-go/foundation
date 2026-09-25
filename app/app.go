@@ -5,7 +5,8 @@ import (
 	"time"
 
 	"github.com/rez-go/stev"
-	"github.com/timemore/foundation/errors"
+
+	"github.com/dirty-go/foundation/errors"
 )
 
 const EnvPrefixDefault = "APP_"
@@ -64,8 +65,11 @@ type Base struct {
 	serversMu sync.Mutex
 }
 
-func (appBase Base) AppInfo() Info      { return appBase.appInfo }
-func (appBase Base) InstanceID() string { return appBase.instanceID }
+// AppInfo returns the app's info.
+func (appBase *Base) AppInfo() Info { return appBase.appInfo }
+
+// InstanceID returns the ID of this running instance of the app.
+func (appBase *Base) InstanceID() string { return appBase.instanceID }
 
 // AddServer adds a server to be run simultaneously. Do NOT call this
 // method after the app has been started.

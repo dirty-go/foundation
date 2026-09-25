@@ -1,0 +1,47 @@
+version: "2"
+
+run:
+  timeout: 5m
+  tests: true
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 50
+
+linters:
+  default: none
+  enable:
+    # correctness
+    - govet
+    - staticcheck
+    - unused
+    - errcheck
+    - errorlint
+    - nilerr
+    - forcetypeassert
+    - ineffassign
+    # style
+    - revive
+    - misspell
+    - predeclared
+    - errname
+    - nolintlint
+    # security & resources (keystore/crypto, HTTP)
+    - gosec
+    - bidichk
+    - bodyclose
+    - noctx
+    # tests
+    - thelper
+    - usetesting
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  settings:
+    gofmt:
+      simplify: true
+    goimports:
+      local-prefixes:
+        - github.com/dirty-go/foundation

@@ -10,9 +10,10 @@ import (
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/s3"
 	"github.com/aws/aws-sdk-go/service/s3/s3manager"
-	"github.com/timemore/foundation/errors"
-	mediastore "github.com/timemore/foundation/media/store"
 	"gopkg.in/yaml.v3"
+
+	"github.com/dirty-go/foundation/errors"
+	mediastore "github.com/dirty-go/foundation/media/store"
 )
 
 type Config struct {

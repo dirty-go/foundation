@@ -1,6 +1,6 @@
 package crypto
 
-import "github.com/timemore/foundation/errors"
+import "github.com/dirty-go/foundation/errors"
 
 var (
 	ErrInvalidKey      = errors.New("key is invalid")

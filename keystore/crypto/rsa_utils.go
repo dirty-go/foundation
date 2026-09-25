@@ -5,7 +5,7 @@ import (
 	"crypto/x509"
 	"encoding/pem"
 
-	"github.com/timemore/foundation/errors"
+	"github.com/dirty-go/foundation/errors"
 )
 
 var (

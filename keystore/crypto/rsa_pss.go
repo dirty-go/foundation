@@ -6,7 +6,7 @@ import (
 	"crypto/rsa"
 	"encoding/base64"
 
-	"github.com/timemore/foundation/errors"
+	"github.com/dirty-go/foundation/errors"
 )
 
 type SigningMethodRSAPSS struct {

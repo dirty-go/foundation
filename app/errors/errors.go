@@ -1,7 +1,7 @@
 package errors
 
 import (
-	"github.com/timemore/foundation/errors"
+	"github.com/dirty-go/foundation/errors"
 )
 
 type Error interface {

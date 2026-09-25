@@ -11,11 +11,12 @@ import (
 	"time"
 
 	gcs "cloud.google.com/go/storage"
-	"github.com/timemore/foundation/errors"
-	mediastore "github.com/timemore/foundation/media/store"
 	"google.golang.org/api/iterator"
 	"google.golang.org/api/option"
 	"gopkg.in/yaml.v3"
+
+	"github.com/dirty-go/foundation/errors"
+	mediastore "github.com/dirty-go/foundation/media/store"
 )
 
 type Config struct {
