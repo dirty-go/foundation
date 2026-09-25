@@ -39,7 +39,8 @@ func RunServers(servers []ServiceServer) {
 
 	// We set up the signal handler (interrupt and terminate).
 	// We are using the signal to gracefully and forcefully stop the server.
-	shutdownSignal := make(chan os.Signal)
+	// Buffered: signal.Notify does not block, so an unbuffered channel can drop the signal.
+	shutdownSignal := make(chan os.Signal, 1)
 	// Listen to interrupt and terminal signals
 	signal.Notify(shutdownSignal, syscall.SIGINT, syscall.SIGTERM)
 
