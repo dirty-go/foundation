@@ -11,10 +11,11 @@ import (
 
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
-	"github.com/timemore/foundation/errors"
-	"github.com/timemore/foundation/media"
-	mediastore "github.com/timemore/foundation/media/store"
 	"gopkg.in/yaml.v3"
+
+	"github.com/dirty-go/foundation/errors"
+	"github.com/dirty-go/foundation/media"
+	mediastore "github.com/dirty-go/foundation/media/store"
 )
 
 type Config struct {

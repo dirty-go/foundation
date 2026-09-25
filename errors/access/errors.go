@@ -1,7 +1,7 @@
 package access
 
 import (
-	"github.com/timemore/foundation/errors"
+	"github.com/dirty-go/foundation/errors"
 )
 
 // Error is an abstract error type for all API access-related errors.

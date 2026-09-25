@@ -3,10 +3,10 @@ package errors
 import (
 	"net/http"
 
-	"github.com/timemore/foundation/api/rest"
-	"github.com/timemore/foundation/errors"
+	"github.com/dirty-go/foundation/api/rest"
+	"github.com/dirty-go/foundation/errors"
 
-	accesserrs "github.com/timemore/foundation/errors/access"
+	accesserrs "github.com/dirty-go/foundation/errors/access"
 )
 
 const HTTPStatusUnknown = 0

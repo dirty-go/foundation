@@ -3,7 +3,7 @@ package rest
 import (
 	"net/http"
 
-	"github.com/timemore/foundation/api"
+	"github.com/dirty-go/foundation/api"
 )
 
 type RequestContext interface {

@@ -6,9 +6,10 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/timemore/foundation/errors"
-	mediastore "github.com/timemore/foundation/media/store"
 	"gopkg.in/yaml.v3"
+
+	"github.com/dirty-go/foundation/errors"
+	mediastore "github.com/dirty-go/foundation/media/store"
 )
 
 type Config struct {

@@ -12,7 +12,8 @@ import (
 	"time"
 
 	"github.com/eapache/go-resiliency/breaker"
-	"github.com/timemore/foundation/errors"
+
+	"github.com/dirty-go/foundation/errors"
 )
 
 type Recover struct {
