@@ -65,7 +65,10 @@ type Base struct {
 	serversMu sync.Mutex
 }
 
-func (appBase *Base) AppInfo() Info      { return appBase.appInfo }
+// AppInfo returns the app's info.
+func (appBase *Base) AppInfo() Info { return appBase.appInfo }
+
+// InstanceID returns the ID of this running instance of the app.
 func (appBase *Base) InstanceID() string { return appBase.instanceID }
 
 // AddServer adds a server to be run simultaneously. Do NOT call this
