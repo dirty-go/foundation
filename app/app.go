@@ -1,3 +1,4 @@
+// Package app provides environment-loading helpers
 package app
 
 import (
@@ -11,12 +12,13 @@ import (
 
 const EnvPrefixDefault = "APP_"
 
+// Default values used by DefaultInfo.
 const (
-	NameDefault                    = "Timemore"
-	URLDefault                     = "https://github.com/timemore"
+	NameDefault                    = "Foundation"
+	URLDefault                     = "https://github.com/dirty-go/foundation"
 	EmailDefault                   = "nop@e-mail.mailer.com"
 	NotificationEmailSenderDefault = "no-reply@e-mail.mailer.com"
-	TeamNameDefault                = "Time More Team's"
+	TeamNameDefault                = "Candi"
 	EnvDefault                     = "dev"
 	DefaultTZLocation              = "UTC"
 )
