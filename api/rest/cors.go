@@ -1,10 +1,11 @@
 package rest
 
 import (
+	"os"
 	"strings"
 
+	"github.com/caarlos0/env/v11"
 	"github.com/emicklei/go-restful/v3"
-	"github.com/rez-go/stev"
 
 	"github.com/dirty-go/foundation/errors"
 )
@@ -20,8 +21,7 @@ type CORSFilterConfig struct {
 }
 
 func SetupCORSFilterByEnv(restContainer *restful.Container, envPrefix string) error {
-	var cfg CORSFilterConfig
-	err := stev.LoadEnv(envPrefix, &cfg)
+	cfg, err := loadCORSFilterConfig(env.Options{Prefix: envPrefix})
 	if err != nil {
 		return errors.Wrap("config loading from environment variables", err)
 	}
@@ -64,4 +64,27 @@ func SetupCORSFilterByEnv(restContainer *restful.Container, envPrefix string) er
 		Container:      restContainer,
 	}.Filter)
 	return nil
+}
+
+// loadCORSFilterConfig leaves AllowedHeaders nil when the variable is unset.
+// env treats an empty value as unset, so an explicitly empty ALLOWED_HEADERS
+// (meaning "allow no headers") is allocated here to keep the stev behaviour.
+func loadCORSFilterConfig(opts env.Options) (CORSFilterConfig, error) {
+	var cfg CORSFilterConfig
+	if err := env.ParseWithOptions(&cfg, opts); err != nil {
+		return cfg, err
+	}
+	if cfg.AllowedHeaders == nil {
+		key := opts.Prefix + "ALLOWED_HEADERS"
+		var set bool
+		if opts.Environment != nil {
+			_, set = opts.Environment[key]
+		} else {
+			_, set = os.LookupEnv(key)
+		}
+		if set {
+			cfg.AllowedHeaders = new(string)
+		}
+	}
+	return cfg, nil
 }

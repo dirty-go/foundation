@@ -5,7 +5,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/rez-go/stev"
+	"github.com/caarlos0/env/v11"
 
 	"github.com/dirty-go/foundation/errors"
 )
@@ -23,18 +23,21 @@ const (
 	DefaultTZLocation              = "UTC"
 )
 
+// Info describes the app. InitByEnvDefault loads it from APP_-prefixed
+// environment variables; the env tag names keep the names previously derived
+// by rez-go/stev.
 type Info struct {
 	// Name of the app
-	Name string
+	Name string `env:"NAME"`
 	// URL Canonical URL of the app
-	URL                     string
-	TermsOfServiceURL       string
-	PrivacyPolicyURL        string
-	Email                   string
-	NotificationEmailSender string
-	TeamName                string
-	Env                     string
-	TZLocation              string
+	URL                     string `env:"URL"`
+	TermsOfServiceURL       string `env:"TERMS_OF_SERVICE_URL"`
+	PrivacyPolicyURL        string `env:"PRIVACY_POLICY_URL"`
+	Email                   string `env:"EMAIL"`
+	NotificationEmailSender string `env:"NOTIFICATION_EMAIL_SENDER"`
+	TeamName                string `env:"TEAM_NAME"`
+	Env                     string `env:"ENV"`
+	TZLocation              string `env:"TZ_LOCATION"`
 	location                *time.Location
 }
 
@@ -104,11 +107,16 @@ var (
 
 func InitByEnvDefault() (App, error) {
 	info := DefaultInfo()
-	err := stev.LoadEnv(EnvPrefixDefault, &info)
-	if err != nil {
+	if err := loadInfoFromEnv(&info, env.Options{Prefix: EnvPrefixDefault}); err != nil {
 		return nil, errors.Wrap("info loading from environment variables", err)
 	}
 	return Init(&info)
+}
+
+// loadInfoFromEnv overrides fields of info with the variables that are set;
+// unset variables keep the values already in info.
+func loadInfoFromEnv(info *Info, opts env.Options) error {
+	return env.ParseWithOptions(info, opts)
 }
 
 func Init(info *Info) (App, error) {
