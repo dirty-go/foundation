@@ -60,7 +60,16 @@ type App interface {
 	AddServer(ServiceServer)
 	Run()
 	IsAllServersAcceptingClients() bool
+
+	// Ready returns a channel that is closed once Run has started and every
+	// server is accepting clients. It is never closed if a server fails to
+	// start.
+	Ready() <-chan struct{}
 }
+
+// readyPollInterval is how often Ready checks IsAcceptingClients on servers
+// that don't implement ReadyNotifier.
+const readyPollInterval = 50 * time.Millisecond
 
 type Base struct {
 	appInfo    Info
@@ -68,6 +77,9 @@ type Base struct {
 
 	servers   []ServiceServer
 	serversMu sync.Mutex
+
+	readyInit sync.Once
+	ready     chan struct{}
 }
 
 // AppInfo returns the app's info.
@@ -86,7 +98,32 @@ func (appBase *Base) AddServer(srv ServiceServer) {
 
 // Run runs all the servers. Do NOT add any new server after this method was called.
 func (appBase *Base) Run() {
+	go waitServersReady(appBase.servers, appBase.readyChan())
 	RunServers(appBase.servers)
+}
+
+// Ready implements App.
+func (appBase *Base) Ready() <-chan struct{} { return appBase.readyChan() }
+
+func (appBase *Base) readyChan() chan struct{} {
+	appBase.readyInit.Do(func() { appBase.ready = make(chan struct{}) })
+	return appBase.ready
+}
+
+// waitServersReady closes ready once every server is accepting clients.
+func waitServersReady(servers []ServiceServer, ready chan<- struct{}) {
+	for _, srv := range servers {
+		if rn, ok := srv.(ReadyNotifier); ok {
+			<-rn.Ready()
+			continue
+		}
+		ticker := time.NewTicker(readyPollInterval)
+		for !srv.IsAcceptingClients() {
+			<-ticker.C
+		}
+		ticker.Stop()
+	}
+	close(ready)
 }
 
 // IsAllServersAcceptingClients checks if every server is accepting clients.

@@ -12,6 +12,7 @@ running one or more servers with graceful shutdown.
 | `ServiceServer` | Interface every runnable server implements. |
 | `NewHTTPServer(name, *http.Server)` | Adapts any `*http.Server` (and so any `http.Handler`) to `ServiceServer`. |
 | `App.AddServer` / `App.Run` | Register servers, then run them all until `SIGINT`/`SIGTERM`. |
+| `App.Ready()` / `ReadyNotifier` | Channel closed once every server accepts clients. |
 | `RunServers([]ServiceServer)` | What `App.Run` calls; usable without an `App`. |
 
 ## Running servers
@@ -21,6 +22,21 @@ running one or more servers with graceful shutdown.
 total, and waits for them to stop. A second signal forces the process to exit
 immediately. If `Serve` returns a non-nil error, `log.Fatal` ends the process.
 
+`Ready` returns a channel that is closed once `Run` has started and every
+server is accepting clients. Since `Run` blocks, wait on it from a goroutine:
+
+```go
+go func() {
+	<-a.Ready()
+	log.Info().Msg("all servers are accepting clients")
+}()
+a.Run()
+```
+
+A server signals readiness by implementing `ReadyNotifier`
+(`Ready() <-chan struct{}`). For servers that don't, `App.Ready` polls
+`IsAcceptingClients`. The channel is never closed if a server fails to start.
+
 `NewHTTPServer` handles the `net/http` details:
 
 - `Serve` binds `srv.Addr` (`:http` if empty), then serves. It returns `nil`
@@ -28,6 +44,7 @@ immediately. If `Serve` returns a non-nil error, `log.Fatal` ends the process.
 - If `srv.TLSConfig` is set, it serves TLS. The certificates must come from
   `TLSConfig.Certificates` or `GetCertificate`.
 - `IsAcceptingClients` / `IsHealthy` are true while the listener is bound.
+- `Ready` (`ReadyNotifier`) is closed once the listener is bound.
 - You build the `*http.Server`, so you control the timeouts. Always set
   `ReadHeaderTimeout`, at least.
 
