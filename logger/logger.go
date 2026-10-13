@@ -1,16 +1,20 @@
 package logger
 
 import (
+	"fmt"
 	"io"
 	"net/http"
 	"os"
 	"path"
+	"strings"
 	"time"
 
-	"github.com/rez-go/stev"
+	"github.com/caarlos0/env/v11"
 	"github.com/rs/zerolog"
 	"github.com/tomasen/realip"
 	"gopkg.in/natefinch/lumberjack.v2"
+
+	"github.com/dirty-go/foundation/errors"
 )
 
 type Fields map[string]any
@@ -51,6 +55,38 @@ func newLogger() Logger {
 	return zerolog.New(os.Stderr)
 }
 
+// loadConfigFromEnv returns the skeleton config overridden by the variables
+// that are set.
+func loadConfigFromEnv(opts env.Options) (Config, error) {
+	cfg := configSkeletonPtr()
+	err := env.ParseWithOptions(&cfg, opts)
+	return cfg, err
+}
+
+// describeConfigError names the fields that failed to load without echoing
+// their values.
+func describeConfigError(err error) string {
+	var aggErr env.AggregateError
+	if !errors.As(err, &aggErr) {
+		return "invalid configuration"
+	}
+	fields := make([]string, 0, len(aggErr.Errors))
+	for _, e := range aggErr.Errors {
+		var parseErr env.ParseError
+		if errors.As(e, &parseErr) {
+			fields = append(fields, "invalid "+parseErr.Name)
+			continue
+		}
+		var notSetErr env.VarIsNotSetError
+		if errors.As(e, &notSetErr) {
+			fields = append(fields, "missing "+notSetErr.Key)
+			continue
+		}
+		fields = append(fields, "invalid configuration")
+	}
+	return strings.Join(fields, ", ")
+}
+
 func newLoggerByEnv() Logger {
 	logger := newLogger()
 
@@ -62,9 +98,12 @@ func newLoggerByEnv() Logger {
 		logger = logger.Level(logLevel)
 	}
 
-	cfg := configSkeletonPtr()
-	err := stev.LoadEnv(EnvPrefixDefault, &cfg)
-	if err == nil {
+	cfg, err := loadConfigFromEnv(env.Options{Prefix: EnvPrefixDefault})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "logger: loading %s* config from environment failed (%s); "+
+			"falling back to default JSON stderr logger, console and file writers not configured\n",
+			EnvPrefixDefault, describeConfigError(err))
+	} else {
 		writers := []io.Writer{
 			zerolog.ConsoleWriter{Out: os.Stderr, TimeFormat: time.RFC3339},
 		}
