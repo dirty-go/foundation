@@ -4,6 +4,7 @@ import (
 	"context"
 	"net"
 	"net/http"
+	"sync"
 	"sync/atomic"
 
 	"github.com/dirty-go/foundation/errors"
@@ -15,16 +16,26 @@ type HTTPServer struct {
 	name      string
 	srv       *http.Server
 	accepting atomic.Bool
+
+	ready      chan struct{}
+	readyClose sync.Once
 }
 
-var _ ServiceServer = &HTTPServer{}
+var (
+	_ ServiceServer = &HTTPServer{}
+	_ ReadyNotifier = &HTTPServer{}
+)
 
 // NewHTTPServer wraps srv as a ServiceServer. The caller owns srv's
 // configuration (Addr, Handler, timeouts, TLSConfig). If srv.TLSConfig is
 // set, it must provide the certificates (Certificates or GetCertificate).
 func NewHTTPServer(name string, srv *http.Server) *HTTPServer {
-	return &HTTPServer{name: name, srv: srv}
+	return &HTTPServer{name: name, srv: srv, ready: make(chan struct{})}
 }
+
+// Ready implements ReadyNotifier. The channel is closed once Serve has bound
+// the listener.
+func (s *HTTPServer) Ready() <-chan struct{} { return s.ready }
 
 // ServerName implements ServiceServer.
 func (s *HTTPServer) ServerName() string { return s.name }
@@ -44,6 +55,7 @@ func (s *HTTPServer) Serve() error {
 
 	s.accepting.Store(true)
 	defer s.accepting.Store(false)
+	s.readyClose.Do(func() { close(s.ready) })
 
 	if s.srv.TLSConfig != nil {
 		err = s.srv.ServeTLS(ln, "", "")
