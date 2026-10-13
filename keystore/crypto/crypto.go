@@ -3,9 +3,10 @@ package crypto
 import (
 	"crypto/x509"
 	"encoding/pem"
-	"fmt"
 	"regexp"
 	"strings"
+
+	"github.com/dirty-go/foundation/errors"
 )
 
 type Certificate struct {
@@ -27,11 +28,11 @@ func ParseCertificate(certificate string) (*Certificate, error) {
 	certificate = "-----BEGIN CERTIFICATE-----\n" + wordWrap(certificate, 75) + "\n-----END CERTIFICATE-----"
 	block, _ := pem.Decode([]byte(certificate))
 	if block == nil {
-		return nil, fmt.Errorf("failed to parse certificate PEM")
+		return nil, errors.New("failed to parse certificate PEM")
 	}
 	cert, err := x509.ParseCertificate(block.Bytes)
 	if err != nil {
-		return nil, fmt.Errorf("failed to parse certificate: " + err.Error())
+		return nil, errors.Wrap("failed to parse certificate", err)
 	}
 	return &Certificate{
 		der:         certificate,
