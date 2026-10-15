@@ -15,7 +15,6 @@ require (
 	github.com/minio/minio-go/v7 v7.0.61
 	github.com/nfnt/resize v0.0.0-20180221191011-83c6a9932646
 	github.com/nyaruka/phonenumbers v1.6.6
-	github.com/rez-go/stev v0.0.0-20220607035830-a584f4607939
 	github.com/rs/zerolog v1.30.0
 	github.com/thoas/stats v0.0.0-20190407194641-965cb2de1678
 	github.com/tomasen/realip v0.0.0-20180522021738-f0c99a92ddce

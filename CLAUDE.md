@@ -13,7 +13,7 @@ Shared Go library ("bootstrapping service") imported by other services — there
 ## Conventions
 
 - Prefer this repo's `errors` package (`github.com/dirty-go/foundation/errors`: `errors.Wrap`, `errors.New`, plus `errors/access`, `errors/data`) over stdlib `errors` in library code.
-- Config is loaded from env via `github.com/rez-go/stev` (`stev.LoadEnv(prefix, &cfg)`) with per-package prefixes (`APP_`, `LOG_`, caller-supplied prefixes for REST/CORS and media store).
+- Config is loaded from env via `github.com/caarlos0/env/v11` (`env.ParseWithOptions(&cfg, env.Options{Prefix: ...})`) with per-package prefixes (`APP_`, `LOG_`, caller-supplied prefixes for REST/CORS and media store). `media/store` loads each registered module's config separately under `<prefix><UPPER(module)>_`; the module named by `STORE_SERVICE` is always loaded; any other module is activated (and its `required` keys enforced) only when one of its declared keys is set.
 - Storage backends (`media/store/{s3,gcs,minio,local}`) self-register with `store.RegisterModule` in `init()`; new backends follow the same pattern.
 
 ## Git
