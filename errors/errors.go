@@ -10,6 +10,7 @@ var (
 	New    = errors.New
 	Msg    = errors.New
 	Unwrap = errors.Unwrap
+	Join   = errors.Join
 )
 
 type Unwrappable interface {
