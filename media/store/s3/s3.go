@@ -17,8 +17,8 @@ import (
 )
 
 type Config struct {
-	Region          string `env:"REGION,required" yaml:"region" json:"region"`
-	BucketName      string `env:"BUCKET_NAME,required" yaml:"bucket_name" json:"bucket_name"`
+	Region          string `env:"REGION,required,notEmpty" yaml:"region" json:"region"`
+	BucketName      string `env:"BUCKET_NAME,required,notEmpty" yaml:"bucket_name" json:"bucket_name"`
 	AccessKeyID     string `env:"ACCESS_KEY_ID" yaml:"access_key_id" json:"access_key_id"`
 	SecretAccessKey string `env:"SECRET_ACCESS_KEY" yaml:"secret_access_key" json:"secret_access_key"`
 }
@@ -56,6 +56,11 @@ func NewService(config mediastore.ServiceConfig) (mediastore.Service, error) {
 	}
 	if conf == nil || conf.Region == "" || conf.BucketName == "" {
 		return nil, errors.ArgMsg("config", "fields invalid")
+	}
+	// A half-set pair would otherwise either fall back to the SDK's ambient
+	// credential chain or fail only on the first request.
+	if (conf.AccessKeyID == "") != (conf.SecretAccessKey == "") {
+		return nil, errors.ArgMsg("config", "access_key_id and secret_access_key must be set together")
 	}
 
 	var creds *credentials.Credentials
