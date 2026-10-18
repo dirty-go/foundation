@@ -19,6 +19,10 @@ import (
 // doesn't implement ReadyNotifier.
 const readyPollInterval = 50 * time.Millisecond
 
+// acceptPanicLogInterval is the minimum time between two logged panics from
+// one server's readiness methods in Group.AllAccepting.
+const acceptPanicLogInterval = time.Minute
+
 var (
 	// ErrStarted is returned by Group.Add and Group.Run once Run has been
 	// called.
@@ -79,6 +83,12 @@ type Group struct {
 	// its goroutine, cleared when Serve returns (even after Run returned).
 	// The slice is assigned under mu when Run starts and never resized.
 	serving []atomic.Bool
+	// panicLogs[i] rate-limits logging of panics in servers[i]'s
+	// IsAcceptingClients or Ready called by AllAccepting. It grows with
+	// servers under mu; the pointers stay valid across appends.
+	panicLogs []*panicLogLimiter
+
+	now func() time.Time // nil means time.Now; set by tests only, before Run and any AllAccepting call
 }
 
 // NewGroup returns a Group configured with opts.
@@ -111,6 +121,9 @@ func (g *Group) Add(servers ...Server) error {
 		return ErrStarted
 	}
 	g.servers = append(g.servers, servers...)
+	for range servers {
+		g.panicLogs = append(g.panicLogs, new(panicLogLimiter))
+	}
 	return nil
 }
 
@@ -142,11 +155,11 @@ func isNil(s Server) bool {
 // one-way latch: once closed it never reopens, even if a server later stops.
 // Use AllAccepting for a current answer, e.g. in a readiness probe.
 //
-// If every Serve returns nil (or the Group is empty), Run closes Ready, if
-// still open, before Done: there is nothing left to wait for.
-//
-// If only some Serve calls return nil, the Group keeps running degraded and
-// Ready may never close, since a stopped server no longer accepts clients.
+// A Serve that returns nil also keeps Ready open, since a stopped server no
+// longer accepts clients: if only some do, the Group runs degraded and Ready
+// may never close; if all do, Run returns with Ready still open. The only
+// exception is an empty Group, which has nothing to wait for: Run closes
+// Ready before Done.
 func (g *Group) Ready() <-chan struct{} {
 	g.init()
 	return g.ready
@@ -169,45 +182,111 @@ func (g *Group) Err() error {
 }
 
 // AllAccepting reports whether every server is accepting clients. It is true
-// for an empty Group.
+// for an empty Group, and false for any non-empty Group once shutdown has
+// begun (ctx done, a Serve failed, or every Serve returned), without asking
+// any server.
 //
-// A server implementing AcceptingReporter is asked directly, also during and
-// after shutdown: reporting false once it stops accepting is its own
-// responsibility. A panic in IsAcceptingClients is recovered, logged and
-// counts as not accepting. Any other server, including one implementing only
-// ReadyNotifier (which AllAccepting doesn't use), counts as accepting while
-// its Serve, started by Run, is running and shutdown hasn't begun: not before
-// Run, not once ctx is done or a Serve fails, and not after Serve returns.
-// That is optimistic, since there is no signal
-// that the server has bound its listener.
+// Otherwise a server is never accepting unless its Serve, started by Run, is
+// running, so never before Run or after its Serve returns (including an
+// abandoned Serve after Run returned); such a server isn't asked. While its
+// Serve runs, it is checked in order of precedence:
+//   - AcceptingReporter: accepting while IsAcceptingClients reports true.
+//   - ReadyNotifier: accepting once its Ready channel is closed, checked
+//     without blocking.
+//   - Otherwise: accepting. That is optimistic, since there is no signal
+//     that the server has bound its listener.
+//
+// A panic in IsAcceptingClients or Ready counts as not accepting. It is
+// logged with its stack at most once a minute per server, together with the
+// number of panics not logged since, so a probe can't flood the log.
 //
 // It is safe to call concurrently with Add and Run.
 func (g *Group) AllAccepting() bool {
 	g.mu.Lock()
 	servers := slices.Clone(g.servers)
+	limits := slices.Clone(g.panicLogs)
 	serving := g.serving
 	g.mu.Unlock()
+	if len(servers) > 0 && serving == nil {
+		return false // before Run nothing is serving
+	}
 	for i, srv := range servers {
-		if ar, ok := srv.(AcceptingReporter); ok {
-			if !isAccepting(g.cfg.logger(), ar) {
-				return false
-			}
-			continue
-		}
-		if serving == nil || !serving[i].Load() || g.stopping.Load() {
+		if !g.accepting(srv, &serving[i], limits[i]) {
 			return false
 		}
 	}
 	return true
 }
 
-// isAccepting calls srv.IsAcceptingClients, treating a panic as false.
-func isAccepting(log *logger.Logger, srv AcceptingReporter) (ok bool) {
-	err := safeCall(log, fmt.Sprintf("%T", srv), "IsAcceptingClients", func() error {
-		ok = srv.IsAcceptingClients()
-		return nil
-	})
-	return ok && err == nil
+// accepting reports whether srv is accepting clients; see AllAccepting.
+// serving reports whether srv's Serve, started by Run, is running; it and
+// stopping are checked again after asking srv, which may take a while.
+func (g *Group) accepting(srv Server, serving *atomic.Bool, limit *panicLogLimiter) bool {
+	if g.stopping.Load() || !serving.Load() {
+		return false
+	}
+	ok := true
+	switch s := srv.(type) {
+	case AcceptingReporter:
+		ok = g.probe(srv, "IsAcceptingClients", limit, s.IsAcceptingClients)
+	case ReadyNotifier:
+		ok = g.probe(srv, "Ready", limit, func() bool {
+			select {
+			case <-s.Ready():
+				return true
+			default:
+				return false
+			}
+		})
+	}
+	return ok && serving.Load() && !g.stopping.Load()
+}
+
+// probe calls f, one of srv's readiness methods, treating a panic as false.
+// It recovers itself instead of using safeCall so that logging is
+// rate-limited per server: a probe may call it many times a second.
+func (g *Group) probe(srv Server, method string, limit *panicLogLimiter, f func() bool) (ok bool) {
+	defer func() {
+		r := recover()
+		if r == nil {
+			return
+		}
+		ok = false
+		suppressed, log := limit.allow(g.clock())
+		if !log {
+			return
+		}
+		g.cfg.logger().Error().Bytes("stack", debug.Stack()).Int64("suppressed", suppressed).
+			Msgf("%T %s panicked: %v (counts as not accepting; logged at most once per %s, "+
+				"suppressed counts the panics not logged since the last one)", srv, method, r, acceptPanicLogInterval)
+	}()
+	return f()
+}
+
+func (g *Group) clock() time.Time {
+	if g.now != nil {
+		return g.now()
+	}
+	return time.Now()
+}
+
+// panicLogLimiter lets one panic per acceptPanicLogInterval be logged and
+// counts the others. It is safe for concurrent use.
+type panicLogLimiter struct {
+	last       atomic.Int64 // UnixNano of the last logged panic; 0 if none
+	suppressed atomic.Int64 // panics not logged since the last logged one
+}
+
+// allow reports whether a panic at now should be logged and, if so, how many
+// panics were suppressed since the last logged one.
+func (l *panicLogLimiter) allow(now time.Time) (suppressed int64, ok bool) {
+	t := now.UnixNano()
+	last := l.last.Load()
+	if (last == 0 || t-last >= int64(acceptPanicLogInterval)) && l.last.CompareAndSwap(last, t) {
+		return l.suppressed.Swap(0), true
+	}
+	l.suppressed.Add(1)
+	return 0, false
 }
 
 // Run starts every server and blocks until they have all stopped.
@@ -227,7 +306,9 @@ func isAccepting(log *logger.Logger, srv AcceptingReporter) (ok bool) {
 // A Serve that returns nil does not trigger shutdown: the other servers keep
 // running and the group runs degraded. If every Serve returns nil there is
 // nothing left to run, so Run returns nil without waiting for ctx and
-// without calling Shutdown.
+// without calling Shutdown. Ready stays open in that case (nothing is
+// serving); select on Done as well. An empty Group closes Ready and returns
+// nil straight away.
 //
 // A panic in Serve, Shutdown or ServerName is recovered and turned into an
 // error naming the server and the panic value; the stack is logged. A
@@ -238,8 +319,11 @@ func isAccepting(log *logger.Logger, srv AcceptingReporter) (ok bool) {
 // with the server name. Each Shutdown error (including a recovered Shutdown
 // panic) is a *ShutdownError; serve errors are not, so callers can use
 // errors.As to treat shutdown failures differently. It is nil after a clean
-// shutdown caused by ctx. Run returns ErrStarted, without side effects, if
-// called more than once.
+// shutdown caused by ctx.
+//
+// A Group runs once. Any further call to Run, whether the first is still
+// running or has returned, returns ErrStarted immediately, without side
+// effects: it doesn't log, exit, or affect the running Group.
 func (g *Group) Run(ctx context.Context) error {
 	g.init()
 	g.mu.Lock()
@@ -334,8 +418,8 @@ wait:
 			}
 		}
 	}
-	// Ready must not close, and fallback servers stop counting as accepting,
-	// once shutdown begins (or after the last Serve).
+	// Ready must not close, and AllAccepting reports false, once shutdown
+	// begins (or after the last Serve).
 	g.stopping.Store(true)
 	g.stopReady()
 	close(stopWaiter)
@@ -344,9 +428,7 @@ wait:
 	shutdownErrs := make([]error, len(servers))
 	shuttingDown := make([]bool, len(servers))
 	pending := 0
-	if running == 0 && len(errs) == 0 {
-		g.closeReady(true) // every Serve returned nil
-	} else {
+	if running > 0 || len(errs) > 0 { // else every Serve returned nil; Ready stays open
 		log.Info().Msg("Shutting down servers...")
 		shutdownCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), g.cfg.timeout())
 		defer cancel()
@@ -400,7 +482,7 @@ wait:
 }
 
 // closeReady closes ready unless it is already closed or, without force,
-// Run has left its wait loop.
+// Run has left its wait loop. Only an empty Group forces it.
 func (g *Group) closeReady(force bool) {
 	g.readyMu.Lock()
 	defer g.readyMu.Unlock()

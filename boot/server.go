@@ -33,21 +33,36 @@ type Server interface {
 
 // ReadyNotifier is optionally implemented by a Server that can signal when it
 // starts accepting clients. Group.Ready prefers it over AcceptingReporter;
-// Group.AllAccepting doesn't use it.
+// Group.AllAccepting uses it only without AcceptingReporter, and only while
+// the server's Serve is running.
 //
 // A wrapper that embeds Server hides this and the other optional interfaces;
 // forward them explicitly (var _ ReadyNotifier = (*wrapper)(nil)).
 type ReadyNotifier interface {
 	// Ready returns a channel that is closed once the server is accepting
 	// clients. It is never closed if the server fails to start.
+	//
+	// Ready must return the same channel on every call, must not block and
+	// must not panic: Group calls it from readiness probes. A panic is
+	// recovered and counts as not ready; during the startup readiness wait it
+	// ends the wait for good, so Ready never closes. A channel made per call
+	// may never be seen closed.
 	Ready() <-chan struct{}
 }
 
 // AcceptingReporter is optionally implemented by a Server that can report
 // whether it is accepting clients. Group.Ready polls it for servers that
-// don't implement ReadyNotifier, and Group.AllAccepting uses it when present.
+// don't implement ReadyNotifier, and Group.AllAccepting prefers it over
+// ReadyNotifier. AllAccepting calls it only while the server's Serve, started
+// by Run, is running and shutdown hasn't begun: a true report outside that
+// window doesn't count.
 type AcceptingReporter interface {
 	// IsAcceptingClients reports whether the server is ready to serve clients.
+	// It must not block and must not panic: Group calls it from the readiness
+	// waiter and from every AllAccepting probe. A blocking call stalls the
+	// waiter (and pins a goroutine per probe). A panic is recovered and
+	// counts as not accepting; during the startup readiness wait it ends the
+	// wait for good, so Ready never closes.
 	IsAcceptingClients() bool
 }
 

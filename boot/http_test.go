@@ -237,8 +237,33 @@ func TestNewHTTPReadHeaderTimeout(t *testing.T) {
 			if srv.ReadHeaderTimeout != tt.want {
 				t.Errorf("ReadHeaderTimeout = %v, want %v", srv.ReadHeaderTimeout, tt.want)
 			}
-			if srv.ReadTimeout != tt.read || srv.WriteTimeout != tt.wr || srv.IdleTimeout != tt.idle {
-				t.Error("NewHTTP changed Read/Write/IdleTimeout")
+			if srv.ReadTimeout != tt.read || srv.WriteTimeout != tt.wr {
+				t.Error("NewHTTP changed Read/WriteTimeout")
+			}
+		})
+	}
+}
+
+func TestNewHTTPIdleTimeout(t *testing.T) {
+	tests := []struct {
+		name       string
+		idle, read time.Duration
+		want       time.Duration
+	}{
+		{name: "none set", want: DefaultIdleTimeout},
+		{name: "IdleTimeout set", idle: time.Second, want: time.Second},
+		{name: "ReadTimeout set", read: time.Second, want: 0}, // net/http uses ReadTimeout for idle
+		{name: "both set", idle: time.Second, read: time.Minute, want: time.Second},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			srv := &http.Server{IdleTimeout: tt.idle, ReadTimeout: tt.read}
+			NewHTTP("x", srv)
+			if srv.IdleTimeout != tt.want {
+				t.Errorf("IdleTimeout = %v, want %v", srv.IdleTimeout, tt.want)
+			}
+			if srv.ReadTimeout != tt.read || srv.WriteTimeout != 0 {
+				t.Error("NewHTTP changed Read/WriteTimeout")
 			}
 		})
 	}

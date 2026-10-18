@@ -1,7 +1,9 @@
 package boot
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"runtime"
@@ -322,8 +324,12 @@ func TestRunAllNilReturns(t *testing.T) {
 	if a.shutdowns.Load() != 0 || b.shutdowns.Load() != 0 {
 		t.Error("Shutdown called on servers that already stopped")
 	}
-	// Deterministic: Ready is closed when every Serve returned nil.
-	waitClosed(t, g.Ready(), true)
+	waitClosed(t, g.Done(), true)
+	// Nothing is serving, so Ready stays open; consumers select on Done.
+	waitClosed(t, g.Ready(), false)
+	if g.AllAccepting() {
+		t.Error("AllAccepting = true with every Serve returned")
+	}
 }
 
 func TestRunNilServer(t *testing.T) {
@@ -442,6 +448,35 @@ func TestRunErrStartedNoLeak(t *testing.T) {
 	eventually(t, func() bool { return runtime.NumGoroutine() <= base }, "goroutine leaked after ErrStarted")
 }
 
+func TestRunRepeatedWhileRunning(t *testing.T) {
+	var buf syncBuffer
+	s := newFake(t, "a")
+	g := NewGroup(WithLogger(zerolog.New(&buf)))
+	if err := g.Add(s); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	ch := runAsync(ctx, g)
+	waitClosed(t, s.started, true)
+	eventually(t, func() bool { return servingAt(g, 0) }, "Serve not running")
+	logged := buf.Len()
+
+	if err := g.Run(ctx); !errors.Is(err, ErrStarted) {
+		t.Fatalf("second Run = %v, want ErrStarted", err)
+	}
+	if buf.Len() != logged {
+		t.Errorf("second Run logged: %q", buf.String()[logged:])
+	}
+	if s.shutdowns.Load() != 0 || !servingAt(g, 0) || len(ch) > 0 {
+		t.Error("second Run affected the running Group")
+	}
+
+	cancel()
+	if err := waitErr(t, ch); err != nil {
+		t.Fatalf("Run = %v", err)
+	}
+}
+
 func TestGroupAddAfterRun(t *testing.T) {
 	g := mustGroup(t, newFake(t, "a"))
 	ctx, cancel := context.WithCancel(t.Context())
@@ -497,13 +532,14 @@ func TestGroupAllAcceptingConcurrentAdd(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for range 50 {
-				if !g.AllAccepting() {
-					t.Error("AllAccepting = false with accepting servers")
-				}
+				g.AllAccepting() // true only while still empty; checked for races
 			}
 		}()
 	}
 	wg.Wait()
+	if g.AllAccepting() {
+		t.Error("AllAccepting before Run = true, want false: nothing is serving")
+	}
 }
 
 func TestGroupReady(t *testing.T) {
@@ -685,14 +721,43 @@ func TestGroupReadyMixed(t *testing.T) {
 
 func TestGroupAllAcceptingWithInterface(t *testing.T) {
 	s := newFake(t, "s")
-	s.accepting.Store(true)
-	g := mustGroup(t, s)
-	if !g.AllAccepting() {
-		t.Fatal("AllAccepting before Run = false, want the interface's true")
+	s.accepting.Store(true)  // reports true throughout, even when not serving
+	o := newFake(t, "other") // keeps the Group running once s stops
+	g := mustGroup(t, s, bare{o})
+	if g.AllAccepting() {
+		t.Fatal("AllAccepting before Run = true, want false: Serve not running")
 	}
+	if n := s.polls.Load(); n != 0 {
+		t.Fatalf("IsAcceptingClients called %d times before Run, want 0", n)
+	}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	ch := runAsync(ctx, g)
+	waitClosed(t, s.started, true)
+	waitClosed(t, o.started, true)
+	eventually(t, g.AllAccepting, "AllAccepting = false while serving and reporting true")
 	s.accepting.Store(false)
 	if g.AllAccepting() {
-		t.Fatal("AllAccepting before Run = true, want the interface's false")
+		t.Error("AllAccepting = true while serving and reporting false")
+	}
+	s.accepting.Store(true)
+
+	s.stopServe()
+	eventually(t, func() bool { return !servingAt(g, 0) }, "Serve did not return")
+	if g.stopping.Load() {
+		t.Fatal("Group stopping after one nil Serve")
+	}
+	polls := s.polls.Load()
+	if g.AllAccepting() {
+		t.Error("AllAccepting = true after Serve returned, want false despite the reporter's true")
+	}
+	if s.polls.Load() != polls {
+		t.Error("AllAccepting asked IsAcceptingClients after Serve returned")
+	}
+
+	cancel()
+	if err := waitErr(t, ch); err != nil {
+		t.Fatalf("Run = %v", err)
 	}
 }
 
@@ -936,10 +1001,313 @@ type panicky struct{ Server }
 
 func (panicky) IsAcceptingClients() bool { panic("accepting boom") }
 
+// readyPanicky panics in Ready.
+type readyPanicky struct{ Server }
+
+func (readyPanicky) Ready() <-chan struct{} { panic("ready boom") }
+
 func TestGroupAllAcceptingPanic(t *testing.T) {
-	g := mustGroup(t, panicky{newFake(t, "panicky")})
+	s := newFake(t, "panicky")
+	g := mustGroup(t, panicky{s})
+	runServing(t, g, s.started)
+	eventually(t, func() bool { return servingAt(g, 0) }, "Serve not running")
 	if g.AllAccepting() {
 		t.Error("AllAccepting = true, want false after IsAcceptingClients panic")
+	}
+}
+
+// runServing runs g until the test ends, waiting for each started channel.
+func runServing(t *testing.T, g *Group, started ...<-chan struct{}) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(t.Context())
+	ch := runAsync(ctx, g)
+	t.Cleanup(func() {
+		cancel()
+		if err := waitErr(t, ch); err != nil {
+			t.Errorf("Run = %v", err)
+		}
+	})
+	for _, c := range started {
+		waitClosed(t, c, true)
+	}
+}
+
+// fakeClock returns a clock for Group.now and a func advancing it.
+func fakeClock() (now func() time.Time, advance func(time.Duration)) {
+	var ns atomic.Int64
+	ns.Store(time.Unix(1000, 0).UnixNano())
+	return func() time.Time { return time.Unix(0, ns.Load()) },
+		func(d time.Duration) { ns.Add(int64(d)) }
+}
+
+// syncBuffer is a bytes.Buffer safe for concurrent use as a log writer.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+func (b *syncBuffer) Len() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Len()
+}
+
+func TestPanicLogLimiterContention(t *testing.T) {
+	const n = 64
+	var l panicLogLimiter
+	now := time.Unix(1_700_000_000, 0)
+
+	var allowed, swapped atomic.Int64
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	for range n {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			if s, ok := l.allow(now); ok {
+				allowed.Add(1)
+				swapped.Add(s) // losers that raced the winner's swap
+			}
+		}()
+	}
+	close(start)
+	wg.Wait()
+
+	if got := allowed.Load(); got != 1 {
+		t.Fatalf("allowed = %d, want exactly 1", got)
+	}
+	suppressed, ok := l.allow(now.Add(acceptPanicLogInterval))
+	if !ok {
+		t.Fatal("allow after interval = false, want true")
+	}
+	if got := swapped.Load() + suppressed; got != n-1 {
+		t.Errorf("suppressed total = %d, want %d (no count lost or duplicated)", got, n-1)
+	}
+}
+
+// suppressedField extracts the "suppressed" count from a JSON log line.
+func suppressedField(t *testing.T, line string) int {
+	t.Helper()
+	var v struct {
+		Suppressed int `json:"suppressed"`
+	}
+	if err := json.Unmarshal([]byte(line), &v); err != nil {
+		t.Fatalf("parse log line %q: %v", line, err)
+	}
+	return v.Suppressed
+}
+
+func TestGroupAllAcceptingPanicRateLimited(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		wrap func(Server) Server
+	}{
+		{"IsAcceptingClients", func(s Server) Server { return panicky{s} }},
+		{"Ready", func(s Server) Server { return readyPanicky{bare{s}} }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var buf syncBuffer
+			now, advance := fakeClock()
+			g := NewGroup(WithLogger(zerolog.New(&buf)))
+			g.now = now
+			s := newFake(t, "panicky")
+			if err := g.Add(tc.wrap(s)); err != nil {
+				t.Fatal(err)
+			}
+			runServing(t, g, s.started)
+			eventually(t, func() bool { return servingAt(g, 0) }, "Serve not running")
+			// AllAccepting's panic logs; the readiness waiter's own (single)
+			// panic log from safeCall doesn't match.
+			logged := func() []string {
+				var lines []string
+				for l := range strings.Lines(buf.String()) {
+					if strings.Contains(l, tc.name+" panicked") && strings.Contains(l, "counts as not accepting") {
+						lines = append(lines, l)
+					}
+				}
+				return lines
+			}
+			probe := func() {
+				if g.AllAccepting() {
+					t.Error("AllAccepting = true, want false after a panic")
+				}
+			}
+
+			const goroutines, calls = 8, 50
+			var wg sync.WaitGroup
+			for range goroutines {
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					for range calls {
+						probe()
+					}
+				}()
+			}
+			wg.Wait()
+			lines := logged()
+			if len(lines) != 1 {
+				t.Fatalf("panic logged %d times within one interval, want 1:\n%s", len(lines), strings.Join(lines, ""))
+			}
+			if !strings.Contains(lines[0], `"stack"`) {
+				t.Errorf("first log = %s, want a stack", lines[0])
+			}
+
+			advance(acceptPanicLogInterval - 1)
+			probe()
+			if n := len(logged()); n != 1 {
+				t.Fatalf("panic logged %d times before the interval passed, want 1", n)
+			}
+
+			advance(1)
+			probe()
+			lines = logged()
+			if len(lines) != 2 {
+				t.Fatalf("panic logged %d times after the interval, want 2", len(lines))
+			}
+			if !strings.Contains(lines[1], `"stack"`) {
+				t.Errorf("second log = %s, want a stack", lines[1])
+			}
+			// Every call but the two logged ones is suppressed exactly once.
+			// Under contention a loser's count can land in the first log (it
+			// raced the winner's swap), so only the total is exact.
+			if got, want := suppressedField(t, lines[0])+suppressedField(t, lines[1]), goroutines*calls; got != want {
+				t.Errorf("suppressed total = %d, want %d", got, want)
+			}
+		})
+	}
+}
+
+func TestGroupReadyPanicNeverReady(t *testing.T) {
+	// A Ready panic in the readiness waiter must not crash the process; the
+	// Group just never becomes ready.
+	var buf syncBuffer
+	s := newFake(t, "panicky")
+	g := NewGroup(WithLogger(zerolog.New(&buf)))
+	if err := g.Add(readyPanicky{bare{s}}); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	ch := runAsync(ctx, g)
+	waitClosed(t, s.started, true)
+	eventually(t, func() bool { return strings.Contains(buf.String(), "readiness check panicked: ready boom") },
+		"readiness waiter panic not logged")
+	waitClosed(t, g.Ready(), false)
+
+	cancel()
+	if err := waitErr(t, ch); err != nil {
+		t.Fatalf("Run = %v", err)
+	}
+	waitClosed(t, g.Ready(), false)
+}
+
+func TestGroupAllAcceptingReporterFalseOnceShutdownBegins(t *testing.T) {
+	unblock := make(chan struct{})
+	s := newFake(t, "reporter")
+	s.accepting.Store(true) // keeps reporting true during shutdown
+	s.onShutdown = func() { <-unblock }
+
+	g := testGroup(WithShutdownTimeout(time.Second), WithShutdownGrace(100*time.Millisecond))
+	if err := g.Add(s); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	ch := runAsync(ctx, g)
+	waitClosed(t, s.started, true)
+	eventually(t, g.AllAccepting, "AllAccepting = false while serving")
+
+	cancel()
+	eventually(t, func() bool { return s.shutdowns.Load() == 1 }, "Shutdown not called")
+	polls := s.polls.Load()
+	if g.AllAccepting() {
+		t.Error("AllAccepting = true during shutdown")
+	}
+	if s.polls.Load() != polls {
+		t.Error("AllAccepting asked IsAcceptingClients during shutdown")
+	}
+
+	close(unblock)
+	if err := waitErr(t, ch); err != nil {
+		t.Fatalf("Run = %v", err)
+	}
+}
+
+func TestGroupAllAcceptingNotifier(t *testing.T) {
+	s := newFake(t, "notifier")
+	n := notifier{bare{s}, make(chan struct{})}
+	o := newFake(t, "other") // keeps the Group running once s stops
+
+	g := mustGroup(t, n, bare{o})
+	if g.AllAccepting() {
+		t.Fatal("AllAccepting before Run = true, want false")
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	ch := runAsync(ctx, g)
+	waitClosed(t, s.started, true)
+	waitClosed(t, o.started, true)
+	if g.AllAccepting() {
+		t.Error("AllAccepting = true before Ready closed")
+	}
+
+	close(n.ch)
+	eventually(t, g.AllAccepting, "AllAccepting = false after Ready closed while serving")
+
+	s.stopServe()
+	eventually(t, func() bool { return !servingAt(g, 0) }, "Serve did not return")
+	if g.stopping.Load() {
+		t.Fatal("Group stopping after one nil Serve")
+	}
+	if g.AllAccepting() {
+		t.Error("AllAccepting = true after Serve returned")
+	}
+
+	cancel()
+	if err := waitErr(t, ch); err != nil {
+		t.Fatalf("Run = %v", err)
+	}
+}
+
+func TestGroupAllAcceptingNotifierFalseOnceShutdownBegins(t *testing.T) {
+	unblock := make(chan struct{})
+	s := newFake(t, "notifier")
+	s.onShutdown = func() { <-unblock }
+	n := notifier{bare{s}, make(chan struct{})}
+	close(n.ch)
+
+	g := testGroup(WithShutdownTimeout(time.Second), WithShutdownGrace(100*time.Millisecond))
+	if err := g.Add(n); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	ch := runAsync(ctx, g)
+	waitClosed(t, s.started, true)
+	eventually(t, g.AllAccepting, "AllAccepting = false while serving")
+
+	cancel()
+	eventually(t, func() bool { return s.shutdowns.Load() == 1 }, "Shutdown not called")
+	if !servingAt(g, 0) {
+		t.Fatal("Serve returned before Shutdown was unblocked")
+	}
+	if g.AllAccepting() {
+		t.Error("AllAccepting = true during shutdown")
+	}
+
+	close(unblock)
+	if err := waitErr(t, ch); err != nil {
+		t.Fatalf("Run = %v", err)
 	}
 }
 
