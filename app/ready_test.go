@@ -6,6 +6,9 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/dirty-go/foundation/boot"
+	"github.com/dirty-go/foundation/errors"
 )
 
 // pollServer implements ServiceServer but not ReadyNotifier.
@@ -17,14 +20,19 @@ func (*pollServer) Shutdown(context.Context) error { return nil }
 func (s *pollServer) IsAcceptingClients() bool     { return s.accepting.Load() }
 func (s *pollServer) IsHealthy() bool              { return s.accepting.Load() }
 
+// waitClosed checks that ch closes (within 2s) or stays open (for 200ms).
 func waitClosed(t *testing.T, ch <-chan struct{}, want bool) {
 	t.Helper()
+	timeout := 200 * time.Millisecond
+	if want {
+		timeout = 2 * time.Second
+	}
 	select {
 	case <-ch:
 		if !want {
 			t.Fatal("channel closed, want open")
 		}
-	case <-time.After(200 * time.Millisecond):
+	case <-time.After(timeout):
 		if want {
 			t.Fatal("channel not closed")
 		}
@@ -58,29 +66,6 @@ func TestHTTPServerReadyNotClosedOnListenError(t *testing.T) {
 	waitClosed(t, s.Ready(), false)
 }
 
-func TestWaitServersReady(t *testing.T) {
-	notifier := NewHTTPServer("http", &http.Server{Addr: "127.0.0.1:0", Handler: http.NotFoundHandler(), ReadHeaderTimeout: time.Second})
-	poller := &pollServer{}
-
-	ready := make(chan struct{})
-	go waitServersReady([]ServiceServer{notifier, poller}, ready)
-
-	done := make(chan error, 1)
-	go func() { done <- notifier.Serve() }()
-	waitClosed(t, notifier.Ready(), true)
-	waitClosed(t, ready, false) // poller not ready yet
-
-	poller.accepting.Store(true)
-	waitClosed(t, ready, true)
-
-	if err := notifier.Shutdown(t.Context()); err != nil {
-		t.Fatalf("Shutdown: %v", err)
-	}
-	if err := <-done; err != nil {
-		t.Fatalf("Serve: %v", err)
-	}
-}
-
 func TestBaseReadyWithoutServers(t *testing.T) {
 	b := &Base{}
 	ch := b.Ready()
@@ -90,4 +75,52 @@ func TestBaseReadyWithoutServers(t *testing.T) {
 	if b.Ready() != ch {
 		t.Error("Ready returned a different channel")
 	}
+}
+
+func TestBaseAddServerNilPanics(t *testing.T) {
+	for name, srv := range map[string]ServiceServer{"nil": nil, "typed nil": (*pollServer)(nil)} {
+		t.Run(name, func(t *testing.T) {
+			defer func() {
+				err, ok := recover().(error)
+				if !ok || !errors.Is(err, boot.ErrNilServer) {
+					t.Fatalf("recovered %v, want error wrapping boot.ErrNilServer", err)
+				}
+			}()
+			(&Base{}).AddServer(srv)
+		})
+	}
+}
+
+func TestBaseAllAcceptingAndRun(t *testing.T) {
+	b := &Base{}
+	srv := &pollServer{}
+	b.AddServer(srv)
+	if b.IsAllServersAcceptingClients() {
+		t.Error("IsAllServersAcceptingClients = true with server not accepting")
+	}
+	srv.accepting.Store(true)
+	if !b.IsAllServersAcceptingClients() {
+		t.Error("IsAllServersAcceptingClients = false with server accepting")
+	}
+
+	// pollServer.Serve returns nil at once; run still waits for ctx, as on main.
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan struct{})
+	go func() { defer close(done); b.run(ctx) }()
+	waitClosed(t, b.Ready(), true)
+	waitClosed(t, done, false)
+	cancel()
+	waitClosed(t, done, true)
+}
+
+func TestBaseAddServerAfterRunPanics(t *testing.T) {
+	b := &Base{}
+	b.run(t.Context()) // no servers: returns at once
+	defer func() {
+		err, ok := recover().(error)
+		if !ok || !errors.Is(err, boot.ErrStarted) {
+			t.Fatalf("recovered %v, want error wrapping boot.ErrStarted", err)
+		}
+	}()
+	b.AddServer(&pollServer{})
 }

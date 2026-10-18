@@ -2,78 +2,89 @@ package app
 
 import (
 	"context"
-	"os"
-	"os/signal"
-	"sync"
-	"syscall"
-	"time"
 
+	"github.com/dirty-go/foundation/boot"
+	"github.com/dirty-go/foundation/errors"
 	"github.com/dirty-go/foundation/logger"
 )
 
 var log = logger.NewPkgLogger()
 
+// RunServers runs servers until SIGINT or SIGTERM, like App.Run: it returns
+// at once for no servers, otherwise blocks until a signal even if every Serve
+// returns nil. A serve failure shuts the other servers down and exits the
+// process (log.Fatal); shutdown errors, including a shutdown abandoned at the
+// deadline, are only logged. A second signal exits with 130/143.
+//
+// Deprecated: use boot.RunSignals, which returns all errors (shutdown ones
+// included) and returns once every server has stopped.
 func RunServers(servers []ServiceServer) {
 	if len(servers) == 0 {
 		return
 	}
+	ctx, stop := boot.SignalContext(context.Background())
+	defer stop()
+	runServers(ctx, servers)
+}
 
-	// Used to determine if all servers have stopped.
-	var serversStopWaiter sync.WaitGroup
-
-	// Start the servers
-	for _, srv := range servers {
-		serversStopWaiter.Add(1)
-		go func(innerSrv ServiceServer) {
-			srvName := innerSrv.ServerName()
-			log.Info().Msgf("Starting %s...", srvName)
-			err := innerSrv.Serve()
-			if err != nil {
-				log.Fatal().Err(err).Msgf("%s serve", srvName)
-			} else {
-				log.Info().Msgf("%s stopped", srvName)
-			}
-			serversStopWaiter.Done()
-		}(srv)
+func runServers(ctx context.Context, servers []ServiceServer) {
+	g := boot.NewGroup()
+	if err := g.Add(servers...); err != nil {
+		log.Fatal().Err(err).Msg("run servers")
 	}
+	checkRunErr(g.Run(ctx))
+	waitSignal(ctx)
+}
 
-	// We set up the signal handler (interrupt and terminate).
-	// We are using the signal to gracefully and forcefully stop the server.
-	// Buffered: signal.Notify does not block, so an unbuffered channel can drop the signal.
-	shutdownSignal := make(chan os.Signal, 1)
-	// Listen to interrupt and terminal signals
-	signal.Notify(shutdownSignal, syscall.SIGINT, syscall.SIGTERM)
-
-	// Wait for the shutdown signal
-	<-shutdownSignal
-
-	log.Info().Msg("Shutting down servers...")
-
-	// Start another routine to catch another signal so the shutdown
-	// could be forced. If we get another signal, we'll exit immediately
-	go func() {
-		<-shutdownSignal
-		log.Info().Msg("Forced shutdown.")
-		os.Exit(0)
-	}()
-
-	// Gracefully shutdown the servers
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer cancel()
-
-	for _, srv := range servers {
-		go func(innerSrv ServiceServer) {
-			srvName := innerSrv.ServerName()
-			log.Info().Msgf("shutting down %s...", srvName)
-			err := innerSrv.Shutdown(shutdownCtx)
-			if err != nil {
-				log.Err(err).Msgf("%s shutdown", srvName)
-			}
-		}(srv)
+// waitSignal blocks until ctx is done, warning if the servers have already
+// stopped (every Serve returned nil, or only shutdown errors) without it.
+func waitSignal(ctx context.Context) {
+	if ctx.Err() == nil {
+		log.Warn().Msg("all servers stopped before shutdown signal; waiting for signal")
 	}
+	<-ctx.Done()
+}
 
-	// Wait for all servers to stop.
-	serversStopWaiter.Wait()
+// checkRunErr handles boot.Group.Run's result for the deprecated shims,
+// keeping the pre-boot behaviour: shutdown failures are logged, anything else
+// exits the process. boot has already logged each failure in full.
+func checkRunErr(err error) {
+	if err == nil {
+		return
+	}
+	if !shutdownOnly(err) {
+		log.Fatal().Err(err).Msg("run servers")
+	}
+	log.Error().Msg("servers stopped with shutdown errors")
+}
 
-	log.Info().Msg("Done.")
+// shutdownOnly reports whether err is shutdown-only: a non-empty join (or
+// nested joins) whose every leaf is a direct *boot.ShutdownError or boot's
+// abandoned error. A stuck shutdown used to hang rather than exit, so
+// abandonment is not treated as fatal.
+//
+// It is deliberately structural rather than using errors.As/Is: Run wraps
+// each serve error with the server name, so a serve error whose chain holds a
+// ShutdownError or ErrAbandoned (e.g. a wrapped nested Group's result) would
+// be misclassified as shutdown-only, and walking arbitrary user Unwrap chains
+// can be unbounded. Only joins are recursed into; any other leaf is fatal
+// unless it is exactly what boot produces.
+func shutdownOnly(err error) bool {
+	if err == nil {
+		return false
+	}
+	if j, ok := err.(interface{ Unwrap() []error }); ok {
+		errs := j.Unwrap()
+		for _, e := range errs {
+			if !shutdownOnly(e) {
+				return false
+			}
+		}
+		return len(errs) > 0
+	}
+	if _, ok := err.(*boot.ShutdownError); ok { //nolint:errorlint // direct leaf only; see above
+		return true
+	}
+	// boot builds the abandoned leaf as fmt.Errorf("%w (...)", ErrAbandoned).
+	return err == boot.ErrAbandoned || errors.Unwrap(err) == boot.ErrAbandoned //nolint:errorlint // direct leaf only; see above
 }

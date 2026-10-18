@@ -30,6 +30,27 @@ var (
 	ErrAbandoned = errors.New("boot: abandoned after shutdown deadline")
 )
 
+// ShutdownError reports a failed (or panicking) Shutdown call in Group.Run's
+// result. Use errors.As to tell shutdown failures apart from serve failures.
+type ShutdownError struct {
+	// Server is the failing server's name (its ServerName).
+	Server string
+	// Err is the non-nil error returned by Shutdown, or the recovered panic.
+	Err error
+}
+
+// Error returns "<server> shutdown: <err>", or "<server> shutdown failed" if
+// Err is nil (never the case for errors returned by Group.Run).
+func (e *ShutdownError) Error() string {
+	if e.Err == nil {
+		return e.Server + " shutdown failed"
+	}
+	return e.Server + " shutdown: " + e.Err.Error()
+}
+
+// Unwrap returns e.Err.
+func (e *ShutdownError) Unwrap() error { return e.Err }
+
 // Group runs a set of servers together; see Group.Run. The zero value is
 // usable with default options. A Group runs once.
 type Group struct {
@@ -166,8 +187,11 @@ func (g *Group) AllAccepting() bool {
 //
 // The result joins the triggering serve error, any serve errors returned
 // during shutdown, any Shutdown errors and ErrAbandoned. Errors are prefixed
-// with the server name. It is nil after a clean shutdown caused by ctx. Run
-// returns ErrStarted, without side effects, if called more than once.
+// with the server name. Each Shutdown error (including a recovered Shutdown
+// panic) is a *ShutdownError; serve errors are not, so callers can use
+// errors.As to treat shutdown failures differently. It is nil after a clean
+// shutdown caused by ctx. Run returns ErrStarted, without side effects, if
+// called more than once.
 func (g *Group) Run(ctx context.Context) error {
 	g.init()
 	g.mu.Lock()
@@ -288,7 +312,7 @@ wait:
 			shuttingDown[r.i] = false
 			if r.err != nil {
 				log.Err(r.err).Msgf("%s shutdown", names[r.i])
-				shutdownErrs[r.i] = errors.Wrap(names[r.i]+" shutdown", r.err)
+				shutdownErrs[r.i] = &ShutdownError{Server: names[r.i], Err: r.err}
 			}
 		case <-waiter:
 			waiter = nil
@@ -342,7 +366,8 @@ func serverNames(log *logger.Logger, servers []Server) ([]string, error) {
 }
 
 // abandonedError names the servers whose Serve or Shutdown is still running,
-// or returns nil if there are none.
+// or returns nil if there are none. The result wraps ErrAbandoned directly
+// (errors.Unwrap returns it); app's deprecated shims rely on that shape.
 func abandonedError(names []string, serving, shuttingDown []bool) error {
 	var parts []string
 	for _, call := range []struct {
