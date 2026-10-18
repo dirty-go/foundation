@@ -28,8 +28,10 @@ global state (besides the signal handler `SignalContext` installs while in use).
   timeout + grace. Past that it returns `ErrAbandoned` naming the stuck
   servers; their goroutines are abandoned and may outlive `Run`.
 - `Run` returns the serve error(s) joined with any `Shutdown` errors, or `nil`
-  after a clean shutdown caused by `ctx`. Errors carry the server name (and,
-  for `HTTP`, the address). It never exits the process.
+  after a clean shutdown caused by `ctx`. Each `Shutdown` error (or recovered
+  `Shutdown` panic) is a `*ShutdownError`, so `errors.As` separates shutdown
+  failures from serve failures. Errors carry the server name (and, for
+  `HTTP`, the address). It never exits the process.
 - Panics in `Serve`, `Shutdown` and `ServerName` are recovered into errors;
   the stack is logged.
 - A `Serve` returning `nil` early doesn't stop the others (the group runs
@@ -77,6 +79,54 @@ func main() {
 }
 ```
 
-Custom servers (gRPC, queue consumers) implement `Server`; see the `app`
-README for a gRPC example. `Shutdown` must make `Serve` return and must cope
+## Custom servers
+
+Implement `Server` for anything that isn't `net/http`, such as gRPC or
+queue consumers. `Serve` must block until stopped and return `nil` on a
+graceful `Shutdown`. `Shutdown` must make `Serve` return and must cope
 with being called before `Serve` starts or after it returned.
+
+```go
+type grpcServer struct {
+	addr      string
+	srv       *grpc.Server
+	accepting atomic.Bool
+}
+
+func (s *grpcServer) ServerName() string { return "grpc" }
+
+func (s *grpcServer) Serve() error {
+	ln, err := net.Listen("tcp", s.addr)
+	if err != nil {
+		return err
+	}
+	s.accepting.Store(true)
+	defer s.accepting.Store(false)
+	return s.srv.Serve(ln) // returns nil after GracefulStop
+}
+
+func (s *grpcServer) Shutdown(ctx context.Context) error {
+	done := make(chan struct{})
+	go func() { s.srv.GracefulStop(); close(done) }()
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		s.srv.Stop()
+		return ctx.Err()
+	}
+}
+
+func (s *grpcServer) IsAcceptingClients() bool { return s.accepting.Load() }
+func (s *grpcServer) IsHealthy() bool          { return s.accepting.Load() }
+```
+
+To report something other than "listening" from `IsHealthy`, such as a DB
+ping, embed `*boot.HTTP` and override `IsHealthy`.
+
+## Migrating from `app`
+
+`app.ServiceServer`, `app.ReadyNotifier`, `app.HTTPServer`,
+`app.NewHTTPServer` and `app.RunServers` are deprecated aliases/forwarders
+for this package; see the [`app` README](../app/README.md#server-lifecycle-moved-to-boot)
+for the migration and behaviour changes.

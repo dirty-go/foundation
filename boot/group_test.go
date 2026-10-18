@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -230,6 +231,39 @@ func TestRunServeAndShutdownErrors(t *testing.T) {
 	if !errors.Is(err, errServe) || !errors.Is(err, errShutdown) {
 		t.Fatalf("Run = %v, want both %v and %v", err, errServe, errShutdown)
 	}
+	var se *ShutdownError
+	if !errors.As(err, &se) || se.Server != "other" {
+		t.Errorf("Run = %v, want *ShutdownError for other", err)
+	}
+}
+
+func TestRunShutdownErrorType(t *testing.T) {
+	errShutdown := errors.New("shutdown failed")
+	s := newFake(t, "s")
+	s.shutdownErr = errShutdown
+
+	ctx, cancel := context.WithCancel(t.Context())
+	ch := runAsync(ctx, mustGroup(t, s))
+	waitClosed(t, s.started, true)
+	cancel()
+	err := waitErr(t, ch)
+	var se *ShutdownError
+	if !errors.As(err, &se) || se.Server != "s" || !errors.Is(se, errShutdown) {
+		t.Fatalf("Run = %v, want *ShutdownError for s wrapping %v", err, errShutdown)
+	}
+	if got, want := err.Error(), "s shutdown: shutdown failed"; got != want {
+		t.Errorf("Run = %q, want %q", got, want)
+	}
+}
+
+func TestShutdownErrorNilErr(t *testing.T) {
+	e := &ShutdownError{Server: "s"}
+	if got, want := e.Error(), "s shutdown failed"; got != want {
+		t.Errorf("Error() = %q, want %q", got, want)
+	}
+	if e.Unwrap() != nil {
+		t.Errorf("Unwrap() = %v, want nil", e.Unwrap())
+	}
 }
 
 func TestRunServeErrorAfterCancel(t *testing.T) {
@@ -324,6 +358,9 @@ func TestRunPanicShutdown(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "panicky shutdown: panic: shutdown boom") {
 		t.Fatalf("Run = %v, want recovered shutdown panic", err)
 	}
+	if se := (*ShutdownError)(nil); !errors.As(err, &se) {
+		t.Errorf("Run = %v, want a *ShutdownError", err)
+	}
 }
 
 func TestRunPanicServerName(t *testing.T) {
@@ -358,10 +395,23 @@ func TestRunHardDeadline(t *testing.T) {
 	if !errors.Is(err, ErrAbandoned) {
 		t.Fatalf("Run = %v, want ErrAbandoned", err)
 	}
+	// app.shutdownOnly matches the abandoned leaf structurally; pin its shape.
+	if !hasAbandonedLeaf(err) {
+		t.Errorf("Run = %v, want a joined leaf whose Unwrap is ErrAbandoned", err)
+	}
 	if msg := err.Error(); !strings.Contains(msg, "serve: stuck") || strings.Contains(msg, "fine") {
 		t.Errorf("Run = %q, want only the stuck server named", msg)
 	}
 	waitClosed(t, g.Done(), true)
+}
+
+// hasAbandonedLeaf reports whether err is, or joins, a leaf that directly
+// wraps ErrAbandoned.
+func hasAbandonedLeaf(err error) bool {
+	if j, ok := err.(interface{ Unwrap() []error }); ok {
+		return slices.ContainsFunc(j.Unwrap(), hasAbandonedLeaf)
+	}
+	return errors.Unwrap(err) == ErrAbandoned //nolint:errorlint // structural shape check
 }
 
 func TestRunErrStartedNoLeak(t *testing.T) {

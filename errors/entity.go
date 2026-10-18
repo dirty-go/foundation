@@ -47,6 +47,7 @@ func (e entityError) Error() string {
 	return "invalid entity"
 }
 
-func (e entityError) Unwrap() error { return &e }
+// Unwrap returns the wrapped cause.
+func (e entityError) Unwrap() error { return e.err }
 
 func (e entityError) EntityIdentifier() string { return e.identifier }

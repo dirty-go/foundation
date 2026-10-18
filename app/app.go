@@ -2,11 +2,14 @@
 package app
 
 import (
+	"context"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/caarlos0/env/v11"
 
+	"github.com/dirty-go/foundation/boot"
 	"github.com/dirty-go/foundation/errors"
 )
 
@@ -57,7 +60,7 @@ type App interface {
 	AppInfo() Info
 	InstanceID() string
 
-	AddServer(ServiceServer)
+	AddServer(boot.Server)
 	Run()
 	IsAllServersAcceptingClients() bool
 
@@ -67,19 +70,14 @@ type App interface {
 	Ready() <-chan struct{}
 }
 
-// readyPollInterval is how often Ready checks IsAcceptingClients on servers
-// that don't implement ReadyNotifier.
-const readyPollInterval = 50 * time.Millisecond
-
+// Base implements App. Its zero value is usable. Server lifecycle is
+// delegated to a boot.Group, so Base can run only once.
 type Base struct {
 	appInfo    Info
 	instanceID string
 
-	servers   []ServiceServer
-	serversMu sync.Mutex
-
-	readyInit sync.Once
-	ready     chan struct{}
+	group   boot.Group
+	servers atomic.Int32 // servers added; Run returns at once if none
 }
 
 // AppInfo returns the app's info.
@@ -88,53 +86,44 @@ func (appBase *Base) AppInfo() Info { return appBase.appInfo }
 // InstanceID returns the ID of this running instance of the app.
 func (appBase *Base) InstanceID() string { return appBase.instanceID }
 
-// AddServer adds a server to be run simultaneously. Do NOT call this
-// method after the app has been started.
-func (appBase *Base) AddServer(srv ServiceServer) {
-	appBase.serversMu.Lock()
-	appBase.servers = append(appBase.servers, srv)
-	appBase.serversMu.Unlock()
-}
-
-// Run runs all the servers. Do NOT add any new server after this method was called.
-func (appBase *Base) Run() {
-	go waitServersReady(appBase.servers, appBase.readyChan())
-	RunServers(appBase.servers)
-}
-
-// Ready implements App.
-func (appBase *Base) Ready() <-chan struct{} { return appBase.readyChan() }
-
-func (appBase *Base) readyChan() chan struct{} {
-	appBase.readyInit.Do(func() { appBase.ready = make(chan struct{}) })
-	return appBase.ready
-}
-
-// waitServersReady closes ready once every server is accepting clients.
-func waitServersReady(servers []ServiceServer, ready chan<- struct{}) {
-	for _, srv := range servers {
-		if rn, ok := srv.(ReadyNotifier); ok {
-			<-rn.Ready()
-			continue
-		}
-		ticker := time.NewTicker(readyPollInterval)
-		for !srv.IsAcceptingClients() {
-			<-ticker.C
-		}
-		ticker.Stop()
+// AddServer adds a server to be run simultaneously. It panics if srv is nil
+// (including a typed nil) or if Run has already been called: both are wiring
+// errors.
+func (appBase *Base) AddServer(srv boot.Server) {
+	// Count first so a racing Run never sees 0 while a server is registered;
+	// undo the count if Add rejects srv.
+	appBase.servers.Add(1)
+	if err := appBase.group.Add(srv); err != nil {
+		appBase.servers.Add(-1)
+		panic(errors.Wrap("app: add server", err))
 	}
-	close(ready)
 }
+
+// Run runs all the servers until SIGINT or SIGTERM. With no servers it
+// returns at once; otherwise it blocks until a signal, even if every Serve
+// returns nil. A serve failure shuts the other servers down gracefully, then
+// exits the process via log.Fatal, as does a second call. Shutdown errors,
+// including a shutdown abandoned at the deadline, are only logged. A second
+// signal exits with 130/143; see boot.SignalContext.
+func (appBase *Base) Run() {
+	ctx, stop := boot.SignalContext(context.Background())
+	defer stop()
+	appBase.run(ctx)
+}
+
+func (appBase *Base) run(ctx context.Context) {
+	checkRunErr(appBase.group.Run(ctx))
+	if appBase.servers.Load() > 0 {
+		waitSignal(ctx)
+	}
+}
+
+// Ready implements App; see boot.Group.Ready.
+func (appBase *Base) Ready() <-chan struct{} { return appBase.group.Ready() }
 
 // IsAllServersAcceptingClients checks if every server is accepting clients.
 func (appBase *Base) IsAllServersAcceptingClients() bool {
-	servers := appBase.servers
-	for _, srv := range servers {
-		if !srv.IsAcceptingClients() {
-			return false
-		}
-	}
-	return true
+	return appBase.group.AllAccepting()
 }
 
 var (
