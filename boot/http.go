@@ -15,6 +15,11 @@ import (
 // that has neither ReadHeaderTimeout nor ReadTimeout.
 const DefaultReadHeaderTimeout = 10 * time.Second
 
+// DefaultIdleTimeout is the IdleTimeout NewHTTP sets on a server that has
+// neither IdleTimeout nor ReadTimeout (net/http uses ReadTimeout for idle
+// keep-alive connections when IdleTimeout is 0).
+const DefaultIdleTimeout = 120 * time.Second
+
 // HTTP adapts an *http.Server to Server so any http.Handler (gin.Engine, chi,
 // go-restful, http.ServeMux, ...) can be run by Run or a Group.
 type HTTP struct {
@@ -36,14 +41,27 @@ var (
 )
 
 // NewHTTP wraps srv as a Server. The caller owns srv's configuration (Addr,
-// Handler, timeouts, TLSConfig) with one exception: if both
-// srv.ReadHeaderTimeout and srv.ReadTimeout are 0, NewHTTP sets
-// srv.ReadHeaderTimeout to DefaultReadHeaderTimeout (mutating the caller's
-// server) to bound slow header reads. ReadTimeout, WriteTimeout and
-// IdleTimeout are never touched; set them for your workload.
+// Handler, timeouts, TLSConfig) with two exceptions, both mutating the
+// caller's server:
 //
-// Call NewHTTP before srv starts serving: net/http reads ReadHeaderTimeout per
-// connection without locking, so the default above would race with a server
+//   - if both srv.ReadHeaderTimeout and srv.ReadTimeout are 0, NewHTTP sets
+//     srv.ReadHeaderTimeout to DefaultReadHeaderTimeout (slow header reads);
+//   - if both srv.IdleTimeout and srv.ReadTimeout are 0, NewHTTP sets
+//     srv.IdleTimeout to DefaultIdleTimeout (idle keep-alive connections
+//     between requests). Behind a load balancer, set IdleTimeout above the
+//     balancer's idle timeout, or reused connections may fail sporadically.
+//
+// These defaults bound only header reads and idle connections. ReadTimeout
+// and WriteTimeout are never touched, so with the defaults a slow request
+// body (ReadTimeout) and a slow response read (WriteTimeout) are still
+// unbounded: a client can hold a connection, its file descriptor and the
+// handler goroutine indefinitely. A default would break streaming uploads and
+// long responses, so set them for your workload, or bound handlers
+// individually with http.MaxBytesReader (body size) and
+// http.ResponseController's SetReadDeadline and SetWriteDeadline.
+//
+// Call NewHTTP before srv starts serving: net/http reads these timeouts per
+// connection without locking, so the defaults above would race with a server
 // that is already running.
 //
 // If srv.TLSConfig is set, it must provide certificates (Certificates,
@@ -57,6 +75,9 @@ func NewHTTP(name string, srv *http.Server) *HTTP {
 	}
 	if srv.ReadHeaderTimeout == 0 && srv.ReadTimeout == 0 {
 		srv.ReadHeaderTimeout = DefaultReadHeaderTimeout
+	}
+	if srv.IdleTimeout == 0 && srv.ReadTimeout == 0 {
+		srv.IdleTimeout = DefaultIdleTimeout
 	}
 	return &HTTP{name: name, srv: srv, ready: make(chan struct{})}
 }

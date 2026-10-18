@@ -10,8 +10,8 @@ global state (besides the signal handler `SignalContext` installs while in use).
 | API | Purpose |
 |---|---|
 | `Server` | Interface every runnable server implements: `ServerName`, `Serve`, `Shutdown`. |
-| `ReadyNotifier` | Optional: `Ready() <-chan struct{}`, closed once the server accepts clients. |
-| `AcceptingReporter` | Optional: `IsAcceptingClients() bool`. Polled by `Group.Ready` (without `ReadyNotifier`) and used by `Group.AllAccepting`. |
+| `ReadyNotifier` | Optional: `Ready() <-chan struct{}`, closed once the server accepts clients. Must return the same channel every call, must not block or panic. |
+| `AcceptingReporter` | Optional: `IsAcceptingClients() bool`. Polled by `Group.Ready` (without `ReadyNotifier`) and preferred by `Group.AllAccepting`, which counts it only while its `Serve` runs and shutdown hasn't begun. Must not block or panic. |
 | `HealthReporter` | Optional: `IsHealthy() bool`. Not used by `Group`; type-assert for your own probes. |
 | `NewHTTP(name, *http.Server)` | Adapts any `*http.Server` (and so any `http.Handler`) to `Server`. |
 | `Run(ctx, servers...)` | Run until `ctx` is done or a server fails. Default options. |
@@ -38,29 +38,36 @@ global state (besides the signal handler `SignalContext` installs while in use).
   the stack is logged.
 - A `Serve` returning `nil` early doesn't stop the others (the group runs
   degraded). If every `Serve` returns `nil`, `Run` returns `nil` straight away
-  and closes `Ready`.
-- `Ready` never closes once shutdown has begun. It is a one-way latch: once
-  closed it never reopens, even if a server stops later. Back readiness probes
-  with `AllAccepting`, not `<-Ready()`.
+  without calling `Shutdown`, and `Ready` stays open: nothing is serving.
+- `Ready` never closes once shutdown has begun, so always select on `Done`
+  too. It is a one-way latch: once closed it never reopens, even if a server
+  stops later. Back readiness probes with `AllAccepting`, not `<-Ready()`.
+  The only exception is an empty group, which has nothing to wait for: `Run`
+  closes `Ready` and returns `nil` immediately.
 - Readiness per server: `ReadyNotifier` if implemented, else
   `AcceptingReporter` (polled every 50ms), else ready while the group's call
   to its `Serve` is running. Every server is re-checked just before `Ready`
   closes: one whose `Serve` has returned (failed, or returned `nil` early,
   even after signalling ready) keeps `Ready` open.
-- `AllAccepting` asks `AcceptingReporter` if implemented, also during and
-  after shutdown (reporting false once it stops accepting is the server's
-  job); a panic there counts as not accepting. It does **not** use
-  `ReadyNotifier`: any other server counts as accepting while its `Serve` is
-  running and shutdown hasn't begun — false before `Run`, from the moment
-  `ctx` is done or a `Serve` fails, and after `Serve` returns, including an
-  abandoned `Serve` after `Run` returned. An empty group is always accepting.
+- `AllAccepting` is `false` for a non-empty group once shutdown has begun
+  (`ctx` done, a `Serve` failed, or every `Serve` returned), without asking
+  any server. A server is never accepting, and isn't asked, unless its
+  `Serve` (started by `Run`) is running: so never before `Run` or after its
+  `Serve` returns, including an abandoned `Serve` after `Run` returned. While
+  it runs, per server: `AcceptingReporter` if implemented, accepting while
+  `IsAcceptingClients()` is true; else `ReadyNotifier`, accepting once
+  `Ready()` is closed; else accepting. A panic in `IsAcceptingClients` or
+  `Ready` counts as not accepting; its stack is logged at most once a minute
+  per server, with the number of panics suppressed since. An empty group is
+  always accepting.
 - The fallback for servers without readiness interfaces is optimistic: there is
   no signal that they have bound a listener. `Run` logs one Info line per such
   server. Implement `ReadyNotifier` or `AcceptingReporter` if that matters.
   A wrapper that embeds `boot.Server` hides them; forward them and assert
   with `var _ boot.ReadyNotifier = (*wrapper)(nil)`.
-- A `Group` runs once: `Add` or `Run` after `Run` returns `ErrStarted`. `Add`
-  rejects nil and typed-nil servers with `ErrNilServer`.
+- A `Group` runs once: `Add` or `Run` after `Run` (still running or
+  returned) returns `ErrStarted`, without logging, exiting or affecting the
+  running group. `Add` rejects nil and typed-nil servers with `ErrNilServer`.
 - `SignalContext`: a second signal calls `os.Exit(130|143)`, skipping defers.
 
 ## HTTP
@@ -68,10 +75,26 @@ global state (besides the signal handler `SignalContext` installs while in use).
 `NewHTTP` binds `srv.Addr` (`:http`, i.e. port 80 on all interfaces, if empty)
 before reporting ready, serves TLS when `srv.TLSConfig` is set (it must carry
 certificates; validated before listening), and returns `nil` after `Shutdown`.
-If neither `ReadHeaderTimeout` nor `ReadTimeout` is set, `NewHTTP` sets
-`ReadHeaderTimeout = DefaultReadHeaderTimeout` (10s) **on your `*http.Server`**;
-other timeouts are left to you. `Shutdown` falls back to `Close` when graceful
-shutdown fails. `NewHTTP(name, nil)` panics.
+`Shutdown` falls back to `Close` when graceful shutdown fails.
+`NewHTTP(name, nil)` panics.
+
+Timeout defaults, set **on your `*http.Server`** (call `NewHTTP` before it
+serves). They bound slow header reads and idle keep-alive connections only:
+
+| Field | Default | Applied when |
+|---|---|---|
+| `ReadHeaderTimeout` | `DefaultReadHeaderTimeout` (10s) | `ReadHeaderTimeout` and `ReadTimeout` are both 0 |
+| `IdleTimeout` | `DefaultIdleTimeout` (120s) | `IdleTimeout` and `ReadTimeout` are both 0 (net/http falls back to `ReadTimeout` for idle keep-alive connections) |
+| `ReadTimeout`, `WriteTimeout` | none | never: they bound the whole request body / response, so a default would cut off streaming uploads and long responses. Set them for your workload, or per request via `http.ResponseController`. |
+
+With these defaults a slow request body (`ReadTimeout`) and a slow response
+read (`WriteTimeout`) are **still unbounded**: a client can hold a
+connection, its file descriptor and the handler goroutine indefinitely. Set
+`ReadTimeout`/`WriteTimeout` for your workload, or bound handlers individually
+with `http.MaxBytesReader` (body size) and `http.ResponseController`'s
+`SetReadDeadline`/`SetWriteDeadline`. Behind a load balancer, keep
+`IdleTimeout` above the balancer's idle timeout, or reused connections may
+fail sporadically.
 
 ## Example
 
@@ -102,7 +125,7 @@ func run() error {
 		select {
 		case <-g.Ready():
 			log.Info().Msg("all servers are accepting clients")
-		case <-g.Done(): // startup failed; Ready never closes
+		case <-g.Done(): // startup failed or every Serve returned; Ready never closes
 		}
 	}()
 

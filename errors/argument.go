@@ -45,16 +45,18 @@ func (e argumentError) ArgumentName() string {
 func (argumentError) CallError() {}
 
 func (e argumentError) Error() string {
+	var errMsg string
+	if e.err != nil {
+		errMsg = e.err.Error()
+	}
 	if e.identifier != "" {
-		if errMsg := e.err.Error(); errMsg != "" {
+		if errMsg != "" {
 			return "arg " + e.identifier + ": " + errMsg
 		}
 		return "arg " + e.identifier + " invalid"
 	}
-	if e.err != nil {
-		if errMsg := e.err.Error(); errMsg != "" {
-			return "arg " + errMsg
-		}
+	if errMsg != "" {
+		return "arg " + errMsg
 	}
 	return "invalid arg"
 }
