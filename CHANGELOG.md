@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v0.2.0] - 2026-10-18
+
 ### Changed
 
 - **BREAKING:** `App.InstanceID` is now always 32 lowercase hex chars and
@@ -96,7 +98,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Removed
 
 - **BREAKING:** the server-lifecycle shims in `app`, deprecated in TASK-004.
-  The last commit with the deprecated shims is a5da92e. Removed identifiers:
+  The last release with the deprecated shims is `v0.1.0`. Removed identifiers:
   - `app.ServiceServer` → `boot.Server`
   - `app.ReadyNotifier` → `boot.ReadyNotifier`
   - `app.HTTPServer` → `boot.HTTP`
@@ -177,3 +179,39 @@ Behaviour differences from the removed shims:
   `Init`.
 - `errors.Arg(name, nil).Error()` no longer panics; it returns
   `"arg <name> invalid"`.
+
+## [v0.1.0] - 2026-10-18
+
+First tagged release. It is the deprecation release for the `app` server
+lifecycle; pin it while migrating to `boot`.
+
+### Added
+
+- `boot` package: runs servers with readiness, bounded graceful shutdown and
+  signal handling (`Run`, `RunSignals`, `Group`, `NewHTTP`, `SignalContext`).
+- `boot.ShutdownError`, so callers can tell shutdown failures from serve
+  failures.
+- `app.HTTPServer` adapter and `App.Ready` / `ReadyNotifier` readiness signal
+  (deprecated in this same release in favour of `boot`).
+
+### Changed
+
+- Config for `app`, `logger`, REST/CORS and `media/store` modules is loaded
+  with `caarlos0/env/v11`; the `stev` dependency is gone.
+- Requires Go 1.24.
+
+### Deprecated
+
+- `app.ServiceServer`, `app.ReadyNotifier`, `app.HTTPServer`,
+  `app.NewHTTPServer`, `app.RunServers` and the `App.AddServer`/`Run`/
+  `Ready`/`IsAllServersAcceptingClients` lifecycle methods. They delegate to
+  `boot` and were removed in `v0.2.0`.
+
+### Fixed
+
+- `errors.Ent`/`EntMsg` errors unwrap to their cause; `errors.Is`/`As` on them
+  no longer loop forever.
+
+[Unreleased]: https://github.com/dirty-go/foundation/compare/v0.2.0...HEAD
+[v0.2.0]: https://github.com/dirty-go/foundation/compare/v0.1.0...v0.2.0
+[v0.1.0]: https://github.com/dirty-go/foundation/releases/tag/v0.1.0

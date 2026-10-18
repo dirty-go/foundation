@@ -260,5 +260,5 @@ healthy := ok && hr.IsHealthy() // pick your own default for !ok
 The `app` shims (`app.ServiceServer`, `app.ReadyNotifier`, `app.HTTPServer`,
 `app.NewHTTPServer`, `app.RunServers`) and `App.AddServer`/`Run`/`Ready`/
 `IsAllServersAcceptingClients` have been removed; use this package directly.
-See [CHANGELOG.md](../CHANGELOG.md) for the migration. The last commit with
-the deprecated shims is a5da92e.
+See [CHANGELOG.md](../CHANGELOG.md) for the migration. The last release with
+the deprecated shims is `v0.1.0`.
