@@ -395,7 +395,7 @@ func TestRunHardDeadline(t *testing.T) {
 	if !errors.Is(err, ErrAbandoned) {
 		t.Fatalf("Run = %v, want ErrAbandoned", err)
 	}
-	// app.shutdownOnly matches the abandoned leaf structurally; pin its shape.
+	// Pin the documented shape: a joined leaf wrapping ErrAbandoned directly.
 	if !hasAbandonedLeaf(err) {
 		t.Errorf("Run = %v, want a joined leaf whose Unwrap is ErrAbandoned", err)
 	}
