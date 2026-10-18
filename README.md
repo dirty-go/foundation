@@ -11,7 +11,7 @@ Running servers, readiness and graceful shutdown live in
 (`app.ServiceServer`, `app.ReadyNotifier`, `app.HTTPServer`,
 `app.NewHTTPServer`, `app.RunServers`) and the `App.AddServer`/`Run`/`Ready`/
 `IsAllServersAcceptingClients` methods have been removed; `app` is identity and
-config only. The last commit with the deprecated shims is a5da92e. See
+config only. The last release with the deprecated shims is `v0.1.0`. See
 [CHANGELOG.md](CHANGELOG.md) for the migration.
 
 ## Env config migration (stev → caarlos0/env)
