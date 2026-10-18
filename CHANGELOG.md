@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **BREAKING:** `App.InstanceID` is now always 32 lowercase hex chars and
+  never exposes the raw MAC or hostname: it is
+  `hex(sha256("dirty-go/foundation/instance-id\x00" + kind + ":" + value)[:16])`
+  with `kind` `mac` or `hostname`, else a random per-process ID. The value
+  changes on every host, so dashboards, metrics and anything else keyed on
+  it will see new IDs. Sources, in order: the MAC of the first up interface
+  that has a MAC and owns a non-loopback, non-link-local IPv4 address (read
+  from the interface's own addresses; the old code took the *last* IPv4 and
+  substring-matched it, so it could pick the wrong interface), else the first
+  up non-loopback MAC, else the hostname, else the random ID. It is never
+  empty. The ID is pseudonymous, not a secret, and unsalted (services on the
+  same host share it); uniqueness is best-effort (see `app/README.md`).
+- `app.Init` keeps the first call's `App` and error: every later call
+  (including `InitByEnvDefault`) returns them and ignores its `Info`. A failed
+  first call now returns its error on every later call instead of
+  `(nil, nil)`.
 - **BREAKING:** `boot.Group` no longer closes `Ready` when every `Serve`
   returns `nil`: nothing is serving, so `Ready` stays open and only `Done`
   closes. Code that waits on `<-g.Ready()` alone now blocks forever in that
@@ -155,5 +171,9 @@ Behaviour differences from the removed shims:
 
 ### Fixed
 
+- `app.TZLocation()` returns `time.UTC` before `Init` and `Info.TZ()` loads
+  `TZLocation` (or returns `time.UTC`) on an `Info` not from `Init`, instead
+  of returning nil. `TZLocation()` no longer races with a concurrent first
+  `Init`.
 - `errors.Arg(name, nil).Error()` no longer panics; it returns
   `"arg <name> invalid"`.
