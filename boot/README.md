@@ -9,8 +9,10 @@ global state (besides the signal handler `SignalContext` installs while in use).
 
 | API | Purpose |
 |---|---|
-| `Server` | Interface every runnable server implements. |
+| `Server` | Interface every runnable server implements: `ServerName`, `Serve`, `Shutdown`. |
 | `ReadyNotifier` | Optional: `Ready() <-chan struct{}`, closed once the server accepts clients. |
+| `AcceptingReporter` | Optional: `IsAcceptingClients() bool`. Polled by `Group.Ready` (without `ReadyNotifier`) and used by `Group.AllAccepting`. |
+| `HealthReporter` | Optional: `IsHealthy() bool`. Not used by `Group`; type-assert for your own probes. |
 | `NewHTTP(name, *http.Server)` | Adapts any `*http.Server` (and so any `http.Handler`) to `Server`. |
 | `Run(ctx, servers...)` | Run until `ctx` is done or a server fails. Default options. |
 | `RunSignals(servers...)` | `Run(SignalContext(context.Background()), servers...)`. For `main`. |
@@ -37,7 +39,26 @@ global state (besides the signal handler `SignalContext` installs while in use).
 - A `Serve` returning `nil` early doesn't stop the others (the group runs
   degraded). If every `Serve` returns `nil`, `Run` returns `nil` straight away
   and closes `Ready`.
-- `Ready` never closes once shutdown has begun.
+- `Ready` never closes once shutdown has begun. It is a one-way latch: once
+  closed it never reopens, even if a server stops later. Back readiness probes
+  with `AllAccepting`, not `<-Ready()`.
+- Readiness per server: `ReadyNotifier` if implemented, else
+  `AcceptingReporter` (polled every 50ms), else ready while the group's call
+  to its `Serve` is running. Every server is re-checked just before `Ready`
+  closes: one whose `Serve` has returned (failed, or returned `nil` early,
+  even after signalling ready) keeps `Ready` open.
+- `AllAccepting` asks `AcceptingReporter` if implemented, also during and
+  after shutdown (reporting false once it stops accepting is the server's
+  job); a panic there counts as not accepting. It does **not** use
+  `ReadyNotifier`: any other server counts as accepting while its `Serve` is
+  running and shutdown hasn't begun — false before `Run`, from the moment
+  `ctx` is done or a `Serve` fails, and after `Serve` returns, including an
+  abandoned `Serve` after `Run` returned. An empty group is always accepting.
+- The fallback for servers without readiness interfaces is optimistic: there is
+  no signal that they have bound a listener. `Run` logs one Info line per such
+  server. Implement `ReadyNotifier` or `AcceptingReporter` if that matters.
+  A wrapper that embeds `boot.Server` hides them; forward them and assert
+  with `var _ boot.ReadyNotifier = (*wrapper)(nil)`.
 - A `Group` runs once: `Add` or `Run` after `Run` returns `ErrStarted`. `Add`
   rejects nil and typed-nil servers with `ErrNilServer`.
 - `SignalContext`: a second signal calls `os.Exit(130|143)`, skipping defers.
@@ -128,12 +149,41 @@ queue consumers. `Serve` must block until stopped and return `nil` on a
 graceful `Shutdown`. `Shutdown` must make `Serve` return and must cope
 with being called before `Serve` starts or after it returned.
 
+Three methods are enough. Without a readiness interface the server counts as
+ready and accepting while its `Serve` runs:
+
+```go
+type consumer struct {
+	q    *queue.Client
+	stop chan struct{} // closed by Shutdown
+	once sync.Once
+}
+
+func (c *consumer) ServerName() string { return "consumer" }
+
+func (c *consumer) Serve() error { return c.q.Consume(c.stop) } // returns nil once stop is closed
+
+func (c *consumer) Shutdown(context.Context) error {
+	c.once.Do(func() { close(c.stop) })
+	return nil
+}
+```
+
+Add the optional interfaces to report readiness precisely, e.g. only once the
+listener is bound:
+
 ```go
 type grpcServer struct {
 	addr      string
 	srv       *grpc.Server
 	accepting atomic.Bool
 }
+
+var (
+	_ boot.Server            = (*grpcServer)(nil)
+	_ boot.AcceptingReporter = (*grpcServer)(nil)
+	_ boot.HealthReporter    = (*grpcServer)(nil)
+)
 
 func (s *grpcServer) ServerName() string { return "grpc" }
 
@@ -159,12 +209,28 @@ func (s *grpcServer) Shutdown(ctx context.Context) error {
 	}
 }
 
+// Optional: AcceptingReporter and HealthReporter.
 func (s *grpcServer) IsAcceptingClients() bool { return s.accepting.Load() }
 func (s *grpcServer) IsHealthy() bool          { return s.accepting.Load() }
 ```
 
 To report something other than "listening" from `IsHealthy`, such as a DB
 ping, embed `*boot.HTTP` and override `IsHealthy`.
+
+### Calling readiness/health through `Server`
+
+`Server` used to require `IsAcceptingClients` and `IsHealthy`. Implementations
+still compile, but code that calls them on a `boot.Server` value must
+type-assert:
+
+```go
+// Before
+healthy := srv.IsHealthy()
+
+// After
+hr, ok := srv.(boot.HealthReporter)
+healthy := ok && hr.IsHealthy() // pick your own default for !ok
+```
 
 ## Migrating from `app`
 

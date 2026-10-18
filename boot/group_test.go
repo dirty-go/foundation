@@ -16,7 +16,8 @@ import (
 )
 
 // fakeServer blocks in Serve until Shutdown, unless configured otherwise. It
-// implements Server but not ReadyNotifier.
+// implements Server, AcceptingReporter and HealthReporter, but not
+// ReadyNotifier. Wrap it in bare to hide the optional interfaces.
 type fakeServer struct {
 	name          string
 	serveErr      error         // Serve returns it immediately
@@ -26,6 +27,7 @@ type fakeServer struct {
 	shutdownDelay time.Duration // Shutdown waits this long, or until ctx is done
 	stuck         bool          // Serve ignores Shutdown until the test ends
 	panicIn       string        // "serve", "shutdown" or "name"
+	goexit        bool          // Serve calls runtime.Goexit
 	onShutdown    func()
 
 	accepting atomic.Bool
@@ -62,6 +64,8 @@ func (s *fakeServer) Serve() error {
 	switch {
 	case s.panicIn == "serve":
 		panic("serve boom")
+	case s.goexit:
+		runtime.Goexit()
 	case s.serveErr != nil:
 		return s.serveErr
 	case s.returnNil:
@@ -99,6 +103,13 @@ func (s *fakeServer) IsAcceptingClients() bool {
 }
 
 func (s *fakeServer) IsHealthy() bool { return s.accepting.Load() }
+
+// bare exposes only the Server methods of the embedded server, hiding any
+// optional interfaces.
+type bare struct{ Server }
+
+// stopServe makes a running Serve return nil without calling Shutdown.
+func (s *fakeServer) stopServe() { s.stopOnce.Do(func() { close(s.stop) }) }
 
 func testGroup(opts ...Option) *Group {
 	return NewGroup(append([]Option{WithLogger(zerolog.Nop())}, opts...)...)
@@ -611,4 +622,330 @@ func TestGroupReadyWaiterStopsAfterRun(t *testing.T) {
 	waitClosed(t, g.Ready(), false)
 }
 
-var _ Server = (*fakeServer)(nil)
+func TestGroupReadyAcceptingOnly(t *testing.T) {
+	poller := newFake(t, "poll")
+	g := mustGroup(t, poller)
+	ctx, cancel := context.WithCancel(t.Context())
+	ch := runAsync(ctx, g)
+
+	eventually(t, func() bool { return poller.polls.Load() > 1 }, "readiness waiter never polled")
+	waitClosed(t, g.Ready(), false)
+	poller.accepting.Store(true)
+	waitClosed(t, g.Ready(), true)
+
+	cancel()
+	if err := waitErr(t, ch); err != nil {
+		t.Fatalf("Run = %v", err)
+	}
+}
+
+func TestGroupReadyBare(t *testing.T) {
+	g := mustGroup(t, bare{newFake(t, "bare")})
+	ctx, cancel := context.WithCancel(t.Context())
+	ch := runAsync(ctx, g)
+
+	waitClosed(t, g.Ready(), true)
+
+	cancel()
+	if err := waitErr(t, ch); err != nil {
+		t.Fatalf("Run = %v", err)
+	}
+}
+
+func TestGroupReadyMixed(t *testing.T) {
+	notifier := newTestHTTP(t)
+	poller := newFake(t, "poll")
+	b := newFake(t, "bare")
+
+	g := mustGroup(t, notifier, poller, bare{b})
+	ctx, cancel := context.WithCancel(t.Context())
+	ch := runAsync(ctx, g)
+
+	waitClosed(t, notifier.Ready(), true)
+	waitClosed(t, b.started, true)
+	waitClosed(t, g.Ready(), false) // poller not ready yet
+	if g.AllAccepting() {
+		t.Error("AllAccepting = true with poller not accepting")
+	}
+
+	poller.accepting.Store(true)
+	waitClosed(t, g.Ready(), true)
+	if !g.AllAccepting() {
+		t.Error("AllAccepting = false with every server accepting")
+	}
+
+	b.stopServe() // degraded: bare server no longer serving
+	eventually(t, func() bool { return !g.AllAccepting() }, "AllAccepting still true after bare Serve returned")
+
+	cancel()
+	if err := waitErr(t, ch); err != nil {
+		t.Fatalf("Run = %v", err)
+	}
+}
+
+func TestGroupAllAcceptingWithInterface(t *testing.T) {
+	s := newFake(t, "s")
+	s.accepting.Store(true)
+	g := mustGroup(t, s)
+	if !g.AllAccepting() {
+		t.Fatal("AllAccepting before Run = false, want the interface's true")
+	}
+	s.accepting.Store(false)
+	if g.AllAccepting() {
+		t.Fatal("AllAccepting before Run = true, want the interface's false")
+	}
+}
+
+func TestGroupAllAcceptingBare(t *testing.T) {
+	s := newFake(t, "bare")
+	g := mustGroup(t, bare{s})
+	if g.AllAccepting() {
+		t.Fatal("AllAccepting before Run = true, want false")
+	}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	ch := runAsync(ctx, g)
+	waitClosed(t, s.started, true)
+	eventually(t, g.AllAccepting, "AllAccepting = false while serving")
+
+	cancel()
+	if err := waitErr(t, ch); err != nil {
+		t.Fatalf("Run = %v", err)
+	}
+	if g.AllAccepting() {
+		t.Error("AllAccepting after Serve returned = true, want false")
+	}
+}
+
+func TestGroupAllAcceptingBareConcurrentRun(t *testing.T) {
+	g := mustGroup(t, bare{newFake(t, "bare")})
+	ctx, cancel := context.WithCancel(t.Context())
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for range 1000 {
+			g.AllAccepting()
+		}
+	}()
+	ch := runAsync(ctx, g)
+	wg.Wait()
+	cancel()
+	if err := waitErr(t, ch); err != nil {
+		t.Fatalf("Run = %v", err)
+	}
+}
+
+// servingAt reports whether g's Serve for server i is running.
+func servingAt(g *Group, i int) bool {
+	g.mu.Lock()
+	serving := g.serving
+	g.mu.Unlock()
+	return serving != nil && serving[i].Load()
+}
+
+// notifier adds a test-controlled ReadyNotifier to a Server.
+type notifier struct {
+	Server
+	ch chan struct{}
+}
+
+func (n notifier) Ready() <-chan struct{} { return n.ch }
+
+// waitReadyAsync runs waitReady in a goroutine; the channel yields its result.
+func waitReadyAsync(stop <-chan struct{}, servers []Server, serving []atomic.Bool) <-chan bool {
+	ch := make(chan bool, 1)
+	go func() { ch <- waitReady(stop, servers, serving) }()
+	return ch
+}
+
+func TestWaitReadyBareServeReturned(t *testing.T) {
+	// A bare server whose Serve already returned (e.g. failed at once)
+	// blocks readiness until stop.
+	serving := make([]atomic.Bool, 1)
+	stop := make(chan struct{})
+	ch := waitReadyAsync(stop, []Server{bare{newFake(t, "failed")}}, serving)
+
+	select {
+	case got := <-ch:
+		t.Fatalf("waitReady = %v before stop, want it to block", got)
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(stop)
+	if <-ch {
+		t.Error("waitReady = true, want false")
+	}
+}
+
+func TestWaitReadyBareStoppedWhileWaiting(t *testing.T) {
+	// A bare server that stops while waitReady blocks on a later server is
+	// re-checked before reporting ready.
+	n := notifier{bare{newFake(t, "slow")}, make(chan struct{})}
+	serving := make([]atomic.Bool, 2)
+	serving[0].Store(true)
+	serving[1].Store(true)
+	stop := make(chan struct{})
+	ch := waitReadyAsync(stop, []Server{bare{newFake(t, "early")}, n}, serving)
+
+	serving[0].Store(false)
+	close(n.ch)
+	select {
+	case got := <-ch:
+		t.Fatalf("waitReady = %v before stop, want it to block", got)
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(stop)
+	if <-ch {
+		t.Error("waitReady = true, want false")
+	}
+}
+
+func TestWaitReadySignalledStoppedWhileWaiting(t *testing.T) {
+	// A ReadyNotifier server that became ready and then stopped while
+	// waitReady blocks on a later server is re-checked too.
+	early := notifier{bare{newFake(t, "early")}, make(chan struct{})}
+	slow := notifier{bare{newFake(t, "slow")}, make(chan struct{})}
+	serving := make([]atomic.Bool, 2)
+	serving[0].Store(true)
+	serving[1].Store(true)
+	stop := make(chan struct{})
+	ch := waitReadyAsync(stop, []Server{early, slow}, serving)
+
+	close(early.ch)
+	serving[0].Store(false)
+	close(slow.ch)
+	select {
+	case got := <-ch:
+		t.Fatalf("waitReady = %v before stop, want it to block", got)
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(stop)
+	if <-ch {
+		t.Error("waitReady = true, want false")
+	}
+}
+
+func TestWaitReadyBareServing(t *testing.T) {
+	serving := make([]atomic.Bool, 1)
+	serving[0].Store(true)
+	if !waitReady(make(chan struct{}), []Server{bare{newFake(t, "ok")}}, serving) {
+		t.Error("waitReady = false with a serving bare server")
+	}
+}
+
+func TestGroupReadyBareStoppedWhileWaiting(t *testing.T) {
+	early := newFake(t, "early")
+	early.returnNil = true
+	slow := newFake(t, "slow") // AcceptingReporter, not accepting yet
+
+	g := mustGroup(t, bare{early}, slow)
+	ctx, cancel := context.WithCancel(t.Context())
+	ch := runAsync(ctx, g)
+
+	eventually(t, func() bool { return slow.polls.Load() > 1 }, "readiness waiter never polled")
+	eventually(t, func() bool { return !servingAt(g, 0) }, "bare Serve still running")
+	slow.accepting.Store(true)
+	polls := slow.polls.Load()
+	eventually(t, func() bool { return slow.polls.Load() > polls }, "readiness waiter stopped polling")
+	waitClosed(t, g.Ready(), false)
+	if g.AllAccepting() {
+		t.Error("AllAccepting = true with a stopped bare server")
+	}
+
+	cancel()
+	if err := waitErr(t, ch); err != nil {
+		t.Fatalf("Run = %v", err)
+	}
+	waitClosed(t, g.Ready(), false)
+}
+
+func TestGroupAllAcceptingFalseOnceShutdownBegins(t *testing.T) {
+	unblock := make(chan struct{})
+	s := newFake(t, "bare")
+	s.onShutdown = func() { <-unblock }
+
+	g := testGroup(WithShutdownTimeout(time.Second), WithShutdownGrace(100*time.Millisecond))
+	if err := g.Add(bare{s}); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	ch := runAsync(ctx, g)
+	waitClosed(t, s.started, true)
+	eventually(t, g.AllAccepting, "AllAccepting = false while serving")
+
+	cancel()
+	eventually(t, func() bool { return s.shutdowns.Load() == 1 }, "Shutdown not called")
+	if !servingAt(g, 0) {
+		t.Fatal("Serve returned before Shutdown was unblocked")
+	}
+	if g.AllAccepting() {
+		t.Error("AllAccepting = true during shutdown")
+	}
+
+	close(unblock)
+	if err := waitErr(t, ch); err != nil {
+		t.Fatalf("Run = %v", err)
+	}
+}
+
+func TestGroupAllAcceptingFalseAfterAbandoned(t *testing.T) {
+	s := newFake(t, "stuck")
+	s.stuck = true
+
+	g := testGroup(WithShutdownTimeout(20*time.Millisecond), WithShutdownGrace(20*time.Millisecond))
+	if err := g.Add(bare{s}); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	ch := runAsync(ctx, g)
+	waitClosed(t, s.started, true)
+	cancel()
+
+	if err := waitErr(t, ch); !errors.Is(err, ErrAbandoned) {
+		t.Fatalf("Run = %v, want ErrAbandoned", err)
+	}
+	if !servingAt(g, 0) {
+		t.Fatal("abandoned Serve not running")
+	}
+	if g.AllAccepting() {
+		t.Error("AllAccepting = true with an abandoned Serve after Run returned")
+	}
+}
+
+func TestRunServeGoexit(t *testing.T) {
+	exiting := newFake(t, "exiting")
+	exiting.goexit = true
+	other := newFake(t, "other")
+
+	g := mustGroup(t, bare{exiting}, other)
+	err := waitErr(t, runAsync(t.Context(), g))
+	if !errors.Is(err, errServeGoexit) || !strings.Contains(err.Error(), "exiting serve") {
+		t.Fatalf("Run = %v, want exiting's Goexit error", err)
+	}
+	if servingAt(g, 0) {
+		t.Error("serving still set after Goexit")
+	}
+	if other.shutdowns.Load() != 1 {
+		t.Error("other server not shut down")
+	}
+	waitClosed(t, g.Ready(), false)
+}
+
+// panicky panics in IsAcceptingClients.
+type panicky struct{ Server }
+
+func (panicky) IsAcceptingClients() bool { panic("accepting boom") }
+
+func TestGroupAllAcceptingPanic(t *testing.T) {
+	g := mustGroup(t, panicky{newFake(t, "panicky")})
+	if g.AllAccepting() {
+		t.Error("AllAccepting = true, want false after IsAcceptingClients panic")
+	}
+}
+
+var (
+	_ Server            = (*fakeServer)(nil)
+	_ AcceptingReporter = (*fakeServer)(nil)
+	_ HealthReporter    = (*fakeServer)(nil)
+	_ Server            = bare{}
+)
