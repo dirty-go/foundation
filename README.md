@@ -4,22 +4,15 @@
 
 Bootstrapping service.
 
-## Server lifecycle moved to `boot`
+## Server lifecycle moved to `boot` (shims removed)
 
-Running servers, readiness and graceful shutdown moved from `app` to
-[`boot`](boot/README.md). `app.ServiceServer`, `app.ReadyNotifier`,
-`app.HTTPServer`, `app.NewHTTPServer` and `app.RunServers` still compile but
-are deprecated; `App.AddServer`/`Run`/`Ready` delegate to `boot`. The shims
-still block until a signal and only log shutdown errors. Notable changes:
-
-- A forced shutdown (second signal) now exits 130/143 instead of 0.
-- `NewHTTPServer` defaults `ReadHeaderTimeout` to 10s when neither it nor
-  `ReadTimeout` is set (affects streaming/SSE services that left timeouts 0).
-- `boot.Run`/`Group.Run` (not the shims) return errors instead of exiting,
-  including shutdown errors (`boot.ShutdownError`), and return once every
-  server has stopped.
-
-See the [`app` migration note](app/README.md#server-lifecycle-moved-to-boot).
+Running servers, readiness and graceful shutdown live in
+[`boot`](boot/README.md). **Breaking:** the deprecated `app` shims
+(`app.ServiceServer`, `app.ReadyNotifier`, `app.HTTPServer`,
+`app.NewHTTPServer`, `app.RunServers`) and the `App.AddServer`/`Run`/`Ready`/
+`IsAllServersAcceptingClients` methods have been removed; `app` is identity and
+config only. The last commit with the deprecated shims is a5da92e. See
+[CHANGELOG.md](CHANGELOG.md) for the migration.
 
 ## Env config migration (stev → caarlos0/env)
 

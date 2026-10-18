@@ -54,16 +54,28 @@ shutdown fails. `NewHTTP(name, nil)` panics.
 
 ## Example
 
+Keep the work in a `run() error` so deferred cleanup (including `stop`) runs
+before the process exits; `log.Fatal`/`os.Exit` skip defers.
+
 ```go
 func main() {
+	if err := run(); err != nil {
+		log.Error().Err(err).Msg("servers")
+		os.Exit(1)
+	}
+}
+
+func run() error {
 	ctx, stop := boot.SignalContext(context.Background())
 	defer stop()
 
 	g := boot.NewGroup(boot.WithShutdownTimeout(10 * time.Second))
-	_ = g.Add(
+	if err := g.Add( // nil servers are rejected (ErrNilServer), not run
 		boot.NewHTTP("api", &http.Server{Addr: ":8080", Handler: apiRouter}),
-		boot.NewHTTP("admin", &http.Server{Addr: ":9090", Handler: adminMux}),
-	)
+		boot.NewHTTP("admin", &http.Server{Addr: "127.0.0.1:9090", Handler: adminMux}),
+	); err != nil {
+		return err
+	}
 
 	go func() {
 		select {
@@ -73,9 +85,39 @@ func main() {
 		}
 	}()
 
-	if err := g.Run(ctx); err != nil {
-		log.Fatal().Err(err).Msg("servers")
+	err := g.Run(ctx)
+	if err == nil && ctx.Err() == nil {
+		// Every Serve returned nil before a signal: nothing is serving.
+		log.Warn().Msg("all servers stopped before shutdown signal")
 	}
+	return err
+}
+```
+
+`Run`'s error includes `Shutdown` failures (`*ShutdownError`) and
+`ErrAbandoned`, not only serve failures. Exiting non-zero on any error is the
+safe default; size `WithShutdownTimeout` + `WithShutdownGrace` to fit your
+orchestrator's termination grace period so a slow drain isn't reported as a
+failure. To treat shutdown-only failures as success, check that **every**
+joined error is a `*ShutdownError` or wraps `ErrAbandoned` — a plain
+`errors.As` also matches when a serve error is present.
+
+## Routers
+
+Every common router is an `http.Handler`, so wire it through `NewHTTP`. Don't
+call the framework's own `Run`/`Start`/`ListenAndServe`; the group owns the
+server lifecycle.
+
+```go
+r := gin.New() // or chi.NewRouter(), echo.New(), restful.NewContainer(), http.NewServeMux()
+r.GET("/ping", func(c *gin.Context) { c.String(http.StatusOK, "pong") })
+
+if err := boot.RunSignals(boot.NewHTTP("api", &http.Server{
+	Addr:              ":8080",
+	Handler:           r,
+	ReadHeaderTimeout: 5 * time.Second,
+})); err != nil {
+	log.Fatal().Err(err).Msg("servers")
 }
 ```
 
@@ -126,7 +168,8 @@ ping, embed `*boot.HTTP` and override `IsHealthy`.
 
 ## Migrating from `app`
 
-`app.ServiceServer`, `app.ReadyNotifier`, `app.HTTPServer`,
-`app.NewHTTPServer` and `app.RunServers` are deprecated aliases/forwarders
-for this package; see the [`app` README](../app/README.md#server-lifecycle-moved-to-boot)
-for the migration and behaviour changes.
+The `app` shims (`app.ServiceServer`, `app.ReadyNotifier`, `app.HTTPServer`,
+`app.NewHTTPServer`, `app.RunServers`) and `App.AddServer`/`Run`/`Ready`/
+`IsAllServersAcceptingClients` have been removed; use this package directly.
+See [CHANGELOG.md](../CHANGELOG.md) for the migration. The last commit with
+the deprecated shims is a5da92e.
