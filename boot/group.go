@@ -8,14 +8,15 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/dirty-go/foundation/errors"
 	"github.com/dirty-go/foundation/logger"
 )
 
-// readyPollInterval is how often Group.Ready checks IsAcceptingClients on
-// servers that don't implement ReadyNotifier.
+// readyPollInterval is how often Group.Ready polls an AcceptingReporter that
+// doesn't implement ReadyNotifier.
 const readyPollInterval = 50 * time.Millisecond
 
 var (
@@ -28,6 +29,8 @@ var (
 	// ErrAbandoned is returned (joined) by Group.Run when Serve or Shutdown
 	// calls were still running at the hard shutdown deadline.
 	ErrAbandoned = errors.New("boot: abandoned after shutdown deadline")
+
+	errServeGoexit = errors.New("runtime.Goexit called in Serve")
 )
 
 // ShutdownError reports a failed (or panicking) Shutdown call in Group.Run's
@@ -65,9 +68,17 @@ type Group struct {
 	readyClosed  bool
 	readyStopped bool // set when Run leaves its wait loop; ready can no longer close
 
+	// stopping is set once shutdown begins (Run leaves its wait loop), before
+	// any Shutdown call, and never cleared.
+	stopping atomic.Bool
+
 	mu      sync.Mutex
 	servers []Server
 	started bool
+	// serving[i] is true while servers[i].Serve runs: set before Run starts
+	// its goroutine, cleared when Serve returns (even after Run returned).
+	// The slice is assigned under mu when Run starts and never resized.
+	serving []atomic.Bool
 }
 
 // NewGroup returns a Group configured with opts.
@@ -118,9 +129,18 @@ func isNil(s Server) bool {
 }
 
 // Ready returns a channel that is closed once Run has started and every
-// server is accepting clients. It is never closed once shutdown has begun, so
-// it stays open if a server fails to start; select on Done as well to avoid
-// waiting forever.
+// server is accepting clients. A server is considered accepting once its
+// ReadyNotifier channel closes; otherwise once its IsAcceptingClients
+// (AcceptingReporter) reports true, polled; otherwise while its Serve, started
+// by Run, is running. The last case is optimistic: there is no signal that
+// such a server has bound its listener. Every server is re-checked just before
+// Ready closes, so any server whose Serve has returned (even one that already
+// signalled ready) keeps Ready open.
+//
+// Ready is never closed once shutdown has begun, so it stays open if a server
+// fails to start; select on Done as well to avoid waiting forever. It is a
+// one-way latch: once closed it never reopens, even if a server later stops.
+// Use AllAccepting for a current answer, e.g. in a readiness probe.
 //
 // If every Serve returns nil (or the Group is empty), Run closes Ready, if
 // still open, before Done: there is nothing left to wait for.
@@ -150,16 +170,44 @@ func (g *Group) Err() error {
 
 // AllAccepting reports whether every server is accepting clients. It is true
 // for an empty Group.
+//
+// A server implementing AcceptingReporter is asked directly, also during and
+// after shutdown: reporting false once it stops accepting is its own
+// responsibility. A panic in IsAcceptingClients is recovered, logged and
+// counts as not accepting. Any other server, including one implementing only
+// ReadyNotifier (which AllAccepting doesn't use), counts as accepting while
+// its Serve, started by Run, is running and shutdown hasn't begun: not before
+// Run, not once ctx is done or a Serve fails, and not after Serve returns.
+// That is optimistic, since there is no signal
+// that the server has bound its listener.
+//
+// It is safe to call concurrently with Add and Run.
 func (g *Group) AllAccepting() bool {
 	g.mu.Lock()
 	servers := slices.Clone(g.servers)
+	serving := g.serving
 	g.mu.Unlock()
-	for _, srv := range servers {
-		if !srv.IsAcceptingClients() {
+	for i, srv := range servers {
+		if ar, ok := srv.(AcceptingReporter); ok {
+			if !isAccepting(g.cfg.logger(), ar) {
+				return false
+			}
+			continue
+		}
+		if serving == nil || !serving[i].Load() || g.stopping.Load() {
 			return false
 		}
 	}
 	return true
+}
+
+// isAccepting calls srv.IsAcceptingClients, treating a panic as false.
+func isAccepting(log *logger.Logger, srv AcceptingReporter) (ok bool) {
+	err := safeCall(log, fmt.Sprintf("%T", srv), "IsAcceptingClients", func() error {
+		ok = srv.IsAcceptingClients()
+		return nil
+	})
+	return ok && err == nil
 }
 
 // Run starts every server and blocks until they have all stopped.
@@ -201,9 +249,11 @@ func (g *Group) Run(ctx context.Context) error {
 	}
 	g.started = true
 	servers := slices.Clone(g.servers)
+	g.serving = make([]atomic.Bool, len(servers))
+	serving := g.serving
 	g.mu.Unlock()
 
-	err := g.run(ctx, servers)
+	err := g.run(ctx, servers, serving)
 	g.err = err
 	close(g.done)
 	return err
@@ -214,7 +264,7 @@ type result struct {
 	err error
 }
 
-func (g *Group) run(ctx context.Context, servers []Server) error {
+func (g *Group) run(ctx context.Context, servers []Server, serving []atomic.Bool) error {
 	log := g.cfg.logger()
 	names, err := serverNames(log, servers)
 	if err != nil {
@@ -225,35 +275,45 @@ func (g *Group) run(ctx context.Context, servers []Server) error {
 		return nil
 	}
 
+	for i, srv := range servers {
+		if !hasReadinessSignal(srv) {
+			log.Info().Msgf("%s has no readiness signal (implements neither ReadyNotifier nor AcceptingReporter); "+
+				"it counts as ready and accepting while its Serve runs", names[i])
+		}
+	}
+
+	serveResults := make(chan result, len(servers))
+	for i, srv := range servers {
+		serving[i].Store(true)
+		go func() {
+			err := errServeGoexit // replaced unless Serve calls runtime.Goexit
+			// Deferred so every exit path clears serving[i] before the
+			// result is sent (defers run last-in, first-out).
+			defer func() { serveResults <- result{i, err} }()
+			defer serving[i].Store(false)
+			log.Info().Msgf("Starting %s...", names[i])
+			err = safeCall(log, names[i], "serve", srv.Serve)
+		}()
+	}
+
+	// Started after every Serve goroutine, so waitReady may treat a server
+	// without readiness interfaces as ready straight away.
 	stopWaiter := make(chan struct{})
 	waiterDone := make(chan struct{})
 	go func() {
 		defer close(waiterDone)
 		_ = safeCall(log, "boot", "readiness check", func() error {
-			if waitReady(stopWaiter, servers) {
+			if waitReady(stopWaiter, servers, serving) {
 				g.closeReady(false)
 			}
 			return nil
 		})
 	}()
 
-	serveResults := make(chan result, len(servers))
-	for i, srv := range servers {
-		go func() {
-			log.Info().Msgf("Starting %s...", names[i])
-			serveResults <- result{i, safeCall(log, names[i], "serve", srv.Serve)}
-		}()
-	}
-
 	var errs []error
-	serving := make([]bool, len(servers))
-	for i := range serving {
-		serving[i] = true
-	}
 	running := len(servers)
 	collect := func(r result) {
 		running--
-		serving[r.i] = false
 		if r.err != nil {
 			log.Err(r.err).Msgf("%s serve", names[r.i])
 			errs = append(errs, errors.Wrap(names[r.i]+" serve", r.err))
@@ -274,7 +334,9 @@ wait:
 			}
 		}
 	}
-	// Ready must not close once shutdown begins (or after the last Serve).
+	// Ready must not close, and fallback servers stop counting as accepting,
+	// once shutdown begins (or after the last Serve).
+	g.stopping.Store(true)
 	g.stopReady()
 	close(stopWaiter)
 
@@ -317,11 +379,17 @@ wait:
 		case <-waiter:
 			waiter = nil
 		case <-deadline.C:
-			abandoned := abandonedError(names, serving, shuttingDown)
+			stillServing := make([]bool, len(serving))
+			for i := range serving {
+				stillServing[i] = serving[i].Load()
+			}
+			abandoned := abandonedError(names, stillServing, shuttingDown)
 			if abandoned != nil {
 				log.Error().Err(abandoned).Msg("Shutdown deadline exceeded")
 			} else {
-				log.Warn().Msg("Readiness check still running at shutdown deadline; abandoned")
+				// Every Serve and Shutdown has returned; only uncollected
+				// results or the readiness check remain.
+				log.Warn().Msg("Shutdown deadline exceeded with results still pending; abandoned")
 			}
 			return errors.Join(append(append(errs, shutdownErrs...), abandoned)...)
 		}
@@ -410,26 +478,59 @@ func safeCall(log *logger.Logger, name, op string, f func() error) (err error) {
 	return f()
 }
 
-// waitReady reports whether every server became ready (ReadyNotifier, else
-// polling IsAcceptingClients). It returns false early when stop is closed.
-func waitReady(stop <-chan struct{}, servers []Server) bool {
-	for _, srv := range servers {
-		if rn, ok := srv.(ReadyNotifier); ok {
-			select {
-			case <-rn.Ready():
-				continue
-			case <-stop:
-				return false
-			}
-		}
-		if !pollAccepting(stop, srv) {
+// hasReadinessSignal reports whether srv implements ReadyNotifier or
+// AcceptingReporter.
+func hasReadinessSignal(srv Server) bool {
+	switch srv.(type) {
+	case ReadyNotifier, AcceptingReporter:
+		return true
+	default:
+		return false
+	}
+}
+
+// waitReady reports whether every server became ready: its ReadyNotifier
+// channel closed, else its AcceptingReporter reported true (polled), else its
+// Serve is still running (serving[i]). Once every signalling server is ready,
+// every server's Serve is checked once more, so one that stopped in the
+// meantime (including a signalling server that became ready and then returned
+// nil) is caught. If one has stopped, or when stop is closed, waitReady waits
+// for stop and returns false.
+func waitReady(stop <-chan struct{}, servers []Server, serving []atomic.Bool) bool {
+	if !waitSignalled(stop, servers) {
+		return false
+	}
+	for i := range servers {
+		if !serving[i].Load() {
+			<-stop
 			return false
 		}
 	}
 	return true
 }
 
-func pollAccepting(stop <-chan struct{}, srv Server) bool {
+// waitSignalled waits for every server implementing ReadyNotifier or
+// AcceptingReporter to become ready. It returns false early when stop is
+// closed.
+func waitSignalled(stop <-chan struct{}, servers []Server) bool {
+	for _, srv := range servers {
+		switch s := srv.(type) {
+		case ReadyNotifier:
+			select {
+			case <-s.Ready():
+			case <-stop:
+				return false
+			}
+		case AcceptingReporter:
+			if !pollAccepting(stop, s) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func pollAccepting(stop <-chan struct{}, srv AcceptingReporter) bool {
 	if srv.IsAcceptingClients() {
 		return true
 	}

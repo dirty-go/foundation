@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **BREAKING:** `boot.Server` is now only `ServerName`, `Serve` and
+  `Shutdown`. `IsAcceptingClients` and `IsHealthy` moved to the optional
+  interfaces `boot.AcceptingReporter` and `boot.HealthReporter`, detected by
+  type assertion like `boot.ReadyNotifier`. `*boot.HTTP` implements all three.
+  - Types that **implement** `Server` keep compiling; the two methods are
+    simply optional now.
+  - Code that **calls** `IsAcceptingClients`/`IsHealthy` on a `boot.Server`
+    value stops compiling and must type-assert. No such caller exists in this
+    module outside `boot` itself.
+
+    ```go
+    // Before
+    ok := srv.IsAcceptingClients()
+
+    // After
+    ar, isAR := srv.(boot.AcceptingReporter)
+    ok := isAR && ar.IsAcceptingClients() // choose the default for !isAR
+    ```
+  - Behaviour: `Group.Ready` uses `ReadyNotifier`, else polls
+    `IsAcceptingClients`, else treats the server as ready while its `Serve`
+    is running (a server whose `Serve` has returned keeps `Ready` open).
+    `Group.AllAccepting` uses `IsAcceptingClients` if implemented (never
+    `ReadyNotifier`), else whether the server's `Serve` is running and
+    shutdown hasn't begun. Custom servers that keep `IsAcceptingClients`
+    behave exactly as before; only servers that drop it get the optimistic
+    fallback (no bound-listener signal), logged once at Info by `Run`.
+  - `Group.AllAccepting` recovers a panic in `IsAcceptingClients` (counts as
+    not accepting). A `Serve` that calls `runtime.Goexit` is reported as a
+    serve error instead of hanging `Run`.
+
 ### Removed
 
 - **BREAKING:** the server-lifecycle shims in `app`, deprecated in TASK-004.

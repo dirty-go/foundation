@@ -29,8 +29,10 @@ type HTTP struct {
 }
 
 var (
-	_ Server        = (*HTTP)(nil)
-	_ ReadyNotifier = (*HTTP)(nil)
+	_ Server            = (*HTTP)(nil)
+	_ ReadyNotifier     = (*HTTP)(nil)
+	_ AcceptingReporter = (*HTTP)(nil)
+	_ HealthReporter    = (*HTTP)(nil)
 )
 
 // NewHTTP wraps srv as a Server. The caller owns srv's configuration (Addr,
@@ -126,8 +128,10 @@ func (s *HTTP) Shutdown(ctx context.Context) error {
 	return nil
 }
 
-// IsAcceptingClients reports whether the server is listening.
+// IsAcceptingClients implements AcceptingReporter: it reports whether the
+// server is listening.
 func (s *HTTP) IsAcceptingClients() bool { return s.accepting.Load() }
 
-// IsHealthy reports whether the server is listening.
+// IsHealthy implements HealthReporter: it reports whether the server is
+// listening.
 func (s *HTTP) IsHealthy() bool { return s.accepting.Load() }
