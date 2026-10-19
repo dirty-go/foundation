@@ -4,7 +4,7 @@ go 1.24.0
 
 require (
 	cloud.google.com/go/storage v1.52.0
-	github.com/aws/aws-sdk-go v1.44.312
+	github.com/aws/aws-sdk-go v1.55.8
 	github.com/caarlos0/env/v11 v11.4.1
 	github.com/eapache/go-resiliency v1.7.0
 	github.com/emicklei/go-restful/v3 v3.10.2
