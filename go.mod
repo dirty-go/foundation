@@ -7,7 +7,7 @@ require (
 	github.com/aws/aws-sdk-go v1.44.312
 	github.com/caarlos0/env/v11 v11.4.1
 	github.com/eapache/go-resiliency v1.7.0
-	github.com/emicklei/go-restful/v3 v3.10.2
+	github.com/emicklei/go-restful/v3 v3.14.0
 	github.com/gabriel-vasile/mimetype v1.4.2
 	github.com/google/uuid v1.6.0
 	github.com/gorilla/schema v1.4.1
